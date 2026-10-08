@@ -1,0 +1,41 @@
+test_deletion_is_explicit_even_without_listener (test_portbw.TestPortbw.test_deletion_is_explicit_even_without_listener) ... ok
+test_foreign_tc_filter_collision_rejected (test_portbw.TestPortbw.test_foreign_tc_filter_collision_rejected) ... ok
+test_foreign_tc_filter_ignored_when_direction_unlimited (test_portbw.TestPortbw.test_foreign_tc_filter_ignored_when_direction_unlimited) ... ok
+test_install_rolls_back_config_and_units_on_failure (test_portbw.TestPortbw.test_install_rolls_back_config_and_units_on_failure) ... ok
+test_install_units_keep_port_policies_no_node_hooks (test_portbw.TestPortbw.test_install_units_keep_port_policies_no_node_hooks) ... ok
+test_mbps_decimal_and_zero (test_portbw.TestPortbw.test_mbps_decimal_and_zero) ... ok
+test_nft_ok_uses_supplied_snapshot_without_new_nft_call (test_portbw.TestPortbw.test_nft_ok_uses_supplied_snapshot_without_new_nft_call) ... ok
+test_nft_sanity_detects_missing_limit_or_counter (test_portbw.TestPortbw.test_nft_sanity_detects_missing_limit_or_counter) ... ok
+test_nft_uses_two_shared_objects_not_per_connection (test_portbw.TestPortbw.test_nft_uses_two_shared_objects_not_per_connection) ... ok
+test_pending_state_retained_on_failure (test_portbw.TestPortbw.test_pending_state_retained_on_failure) ... ok
+test_tc_ok_lists_each_direction_once (test_portbw.TestPortbw.test_tc_ok_lists_each_direction_once) ... ok
+test_tc_rate_is_read_from_real_filter_text_not_json (test_portbw.TestPortbw.test_tc_rate_is_read_from_real_filter_text_not_json) ... ok
+test_tc_uses_clsact_never_root (test_portbw.TestPortbw.test_tc_uses_clsact_never_root) ... ok
+test_explicit_legacy_migration_succeeds_after_full_preflight (test_security.SecurityTests.test_explicit_legacy_migration_succeeds_after_full_preflight) ... ok
+test_forged_other_port_comment_cannot_bypass (test_security.SecurityTests.test_forged_other_port_comment_cannot_bypass) ... ok
+test_install_rollback_enable_then_failure (test_security.SecurityTests.test_install_rollback_enable_then_failure) ... ok
+test_legacy_handle_identical_match_never_adopted (test_security.SecurityTests.test_legacy_handle_identical_match_never_adopted) ... ok
+test_legacy_migration_preflight_failure_never_deletes (test_security.SecurityTests.test_legacy_migration_preflight_failure_never_deletes) ... ok
+test_nft_bad_base_chain_refuses_mutation (test_security.SecurityTests.test_nft_bad_base_chain_refuses_mutation) ... ok
+test_nft_burst_tamper_is_stale (test_security.SecurityTests.test_nft_burst_tamper_is_stale) ... ok
+test_nft_extra_commented_unknown_rule_is_stale (test_security.SecurityTests.test_nft_extra_commented_unknown_rule_is_stale) ... ok
+test_nft_foreign_accept_is_stale (test_security.SecurityTests.test_nft_foreign_accept_is_stale) ... ok
+test_nft_limit_missing_burst_is_stale (test_security.SecurityTests.test_nft_limit_missing_burst_is_stale) ... ok
+test_nft_missing_chain_is_repaired_not_replaced (test_security.SecurityTests.test_nft_missing_chain_is_repaired_not_replaced) ... ok
+test_nft_udp_tamper_is_stale (test_security.SecurityTests.test_nft_udp_tamper_is_stale) ... ok
+test_nft_wrong_rule_order_is_stale (test_security.SecurityTests.test_nft_wrong_rule_order_is_stale) ... ok
+test_old_record_survives_without_listener (test_security.SecurityTests.test_old_record_survives_without_listener) ... ok
+test_tc_burst_mismatch_is_stale (test_security.SecurityTests.test_tc_burst_mismatch_is_stale) ... ok
+test_tc_filter_command_error_not_empty (test_security.SecurityTests.test_tc_filter_command_error_not_empty) ... ok
+test_tc_foreign_same_pref_does_not_get_deleted (test_security.SecurityTests.test_tc_foreign_same_pref_does_not_get_deleted) ... ok
+test_tc_foreign_same_reserved_handle_wrong_match_rejected (test_security.SecurityTests.test_tc_foreign_same_reserved_handle_wrong_match_rejected) ... ok
+test_tc_incorrect_action_alone_is_stale (test_security.SecurityTests.test_tc_incorrect_action_alone_is_stale) ... ok
+test_tc_incorrect_action_extra_match_is_stale (test_security.SecurityTests.test_tc_incorrect_action_extra_match_is_stale) ... ok
+test_tc_json_eth_type_is_legitimate_and_extra_key_is_foreign (test_security.SecurityTests.test_tc_json_eth_type_is_legitimate_and_extra_key_is_foreign) ... ok
+test_tc_unknown_extra_flower_key_stale (test_security.SecurityTests.test_tc_unknown_extra_flower_key_stale) ... ok
+
+----------------------------------------------------------------------
+Ran 35 tests in 0.011s
+
+OK
+41001: 旧版 tc 已迁入独立保留 handle 命名空间
