@@ -1,6 +1,6 @@
 # portbw — TCP/UDP 共享总限速（linshi 测试版）
 
-**本版仅用于恢复快照后的测试机；尚未通过 Debian 12 真机混合 TCP+UDP 压测。** 不需要兼容已经安装过旧 portbw 的服务器。
+**本版仅用于恢复快照后的测试机；修复 Debian 12 tc 共享 action 的 skip_hw 标志冲突，尚未通过 TCP+UDP 真机混合压测。** 不需要兼容已经安装过旧 portbw 的服务器。
 
 将压缩包内 `install.sh`、`portbw.py`、`README.md` **三个文件**上传到 `liucong552-art/linshi` 的 `main` 分支根目录（不是上传 ZIP）。`zuizhongheji` 正式仓库暂时不动。
 

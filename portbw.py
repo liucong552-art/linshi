@@ -583,8 +583,12 @@ def apply_tc(port,rec,iface):
                 raise Error(f'{port}: 清理旧 tc policer 失败：{out.stderr.strip()[:250]}')
         if rec[direction]==0:continue
         kb=tc_burst_kb(rec[direction])
+        # Flower uses skip_hw. A standalone police action must carry the
+        # SAME flag before a flower binds it. Debian 12 / Linux 6.1 rejects
+        # mismatches with: 'Mismatch between action and filter offload flags'.
+        # Keep one standalone police index shared by TCP/UDP and IPv4/IPv6.
         run(['tc','actions','add','action','police','rate',f'{rec[direction]*8}bit',
-             'burst',f'{kb}k','conform-exceed','drop/ok','index',str(index)])
+             'burst',f'{kb}k','conform-exceed','drop/ok','index',str(index),'skip_hw'])
         for _,_,family,transport,pref,_ in theirs:
             field='dst_port' if direction=='up' else 'src_port'
             run(['tc','filter','add','dev',iface,tcdir,'protocol',tc_protocol(family),
