@@ -223,7 +223,8 @@ def owned(items,port):
 
 def expected_comments(port,rec):
     return {comment(direction,port,suffix)
-            for direction in CHAIN if rec[direction]>0 for suffix in ('drop','count')}
+            for direction in CHAIN if rec[direction]>0
+            for suffix in (('drop','count') if direction=='up' else ('count',))}
 
 def _named_ref(expr,kind):
     val=expr.get(kind,'__missing__') if isinstance(expr,dict) else '__missing__'
@@ -277,7 +278,7 @@ def _rule_exact(rule,port,d,kind):
     if expr[1]!={'match':{'op':'==','left':{'payload':{'protocol':'th','field':field}},'right':port}}:
         return False
     if kind=='drop':
-        return _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
+        return d=='up' and _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
     return _named_ref(expr[2],'counter')==countname(d,port)
 
 def nft_ok(port,rec,items=None):
@@ -288,23 +289,28 @@ def nft_ok(port,rec,items=None):
         desired=expected_comments(port,rec)
         rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
         if {x['comment'] for x in rows}!=desired or len(rows)!=len(desired):return False
+        # Inbound: nft and tc can both police. Outbound: nft OUTPUT drops
+        # return EPERM to local UDP sendmsg(), aborting apps such as iperf3.
+        # Only shared tc egress enforces outbound; nft keeps an exact counter.
         expected_obj={(kind,fun(d,port)) for d in CHAIN if rec[d]>0
-                      for kind,fun in (('limit',limitname),('counter',countname))}
+                      for kind,fun in ((('limit',limitname),('counter',countname)) if d=='up'
+                                       else (('counter',countname),))}
         if set(objects)!=expected_obj or len(objects)!=len(expected_obj):return False
         for d in CHAIN:
             if not rec[d]:continue
-            lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
-            if len(lims)!=1:return False
-            lim=lims[0]
-            if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
-                or lim.get('inv') is not True \
-                or _limit_burst(lim)!=burst_bytes(rec[d]):return False
-            for kind in ('drop','count'):
+            if d=='up':
+                lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                if len(lims)!=1:return False
+                lim=lims[0]
+                if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
+                    or lim.get('inv') is not True \
+                    or _limit_burst(lim)!=burst_bytes(rec[d]):return False
+            for kind in (('drop','count') if d=='up' else ('count',)):
                 selected=[r for r in rows if r['comment']==comment(d,port,kind)]
                 if len(selected)!=1 or not _rule_exact(selected[0],port,d,kind):return False
             # DROP must precede named counter, and no earlier accept/bypass exists.
             order={r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
-            if order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
+            if d=='up' and order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
         return True
     except (Error,ValueError,TypeError,KeyError,StopIteration):return False
 
@@ -317,11 +323,18 @@ def apply_nft(port,rec):
         b=rec[d]
         if not b:continue
         l=limitname(d,port);c=countname(d,port);f='dport' if d=='up' else 'sport'
-        script.extend([
-            f'add limit inet {TABLE} {l} {{ rate over {b} bytes/second burst {burst_bytes(b)} bytes; }}',
-            f'add counter inet {TABLE} {c}',
-            f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} limit name "{l}" drop comment "{comment(d,port,"drop")}"',
-            f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} counter name "{c}" comment "{comment(d,port,"count")}"'])
+        if d=='up':
+            script.extend([
+                f'add limit inet {TABLE} {l} {{ rate over {b} bytes/second burst {burst_bytes(b)} bytes; }}',
+                f'add counter inet {TABLE} {c}',
+                f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} limit name "{l}" drop comment "{comment(d,port,"drop")}"',
+                f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} counter name "{c}" comment "{comment(d,port,"count")}"'])
+        else:
+            # No OUTPUT nft DROP: exceedance would raise EPERM to UDP apps.
+            # The single tc egress policer is the enforceable aggregate cap.
+            script.extend([
+                f'add counter inet {TABLE} {c}',
+                f'add rule inet {TABLE} {CHAIN[d]} meta l4proto {{ tcp, udp }} th {f} {port} counter name "{c}" comment "{comment(d,port,"count")}"'])
     if script:run(['nft','-f','-'],input='\n'.join(script)+'\n')
     if not nft_ok(port,rec):raise Error(f'端口 {port}: nft 限速未能通过生效校验')
 
@@ -554,9 +567,10 @@ def apply_tc(port,rec,iface):
                     raise Error(f'{port}: {tcdir} pref={pref} 包含外部规则，拒绝修改')
                 old=tc_find(iface,port,direction,family,transport,rec,rows[tcdir])
                 plan.append((direction,tcdir,family,transport,pref,old))
-    # First install of a direction reserves the global action index with tc
-    # 'actions add', which refuses an existing/foreign index (never 'replace').
-    # Every flower then attaches to that SAME existing action object.
+    # Do not create a *standalone* tc action. Its extra reference can survive
+    # after all flower filters are deleted (Debian 12 reports a failed delete).
+    # Create the shared policer on the first flower, then attach three others.
+    # The action lifetime now follows the flower bindings without global flush.
     for direction in CHAIN:
         tcdir='ingress' if direction=='up' else 'egress'
         theirs=[p for p in plan if p[0]==direction]
@@ -565,36 +579,41 @@ def apply_tc(port,rec,iface):
         if rec[direction]>0 and len(existing)==len(theirs):
             if all(tc_rate_is_ok(old,rec[direction],iface,direction,port,f,t,rec,text)
                    for _,_,f,t,_,old in theirs):continue
-        # We may only delete old rules whose shared action index is exactly ours.
+        index=tc_police_index(port,direction)
+        # Check every old slot before deletion; never adopt foreign bindings.
         for _,_,family,transport,pref,old in existing:
             if not tc_index_attached(text,port,direction,family,transport,pref):
                 raise Error(f'{port}: {tcdir} {transport}/IPv{family} police index 不属于本模块，拒绝删除')
+        if not existing and tc_action_exists(index):
+            raise Error(f'{port}: tc police index {index} 已被占用，拒绝覆盖')
         for _,_,family,transport,pref,old in existing:
             run(['tc','filter','del','dev',iface,tcdir,'protocol',tc_protocol(family),
                  'pref',str(pref),'handle',f'0x{tc_handle(port):x}','flower'])
-        index=tc_police_index(port,direction)
-        if existing:
-            # Standalone actions may remain after the last classifier unbinds.
-            # Delete only the index validated above, ignore 'already gone'.
-            out=subprocess.run(['tc','actions','delete','action','police','index',str(index)],
-                               text=True,capture_output=True,timeout=25)
-            if out.returncode and not any(x in (out.stderr or '').lower() for x in
-                    ('no such file','cannot find','does not exist')):
-                raise Error(f'{port}: 清理旧 tc policer 失败：{out.stderr.strip()[:250]}')
+        # The last flower must release its police action. If another rule
+        # still binds the index, refuse rather than delete another owner's action.
+        if existing and tc_action_exists(index):
+            raise Error(f'{port}: 删除 flower 后 police index {index} 仍存在；拒绝强制清理，请恢复测试快照')
         if rec[direction]==0:continue
         kb=tc_burst_kb(rec[direction])
-        # Flower uses skip_hw. A standalone police action must carry the
-        # SAME flag before a flower binds it. Debian 12 / Linux 6.1 rejects
-        # mismatches with: 'Mismatch between action and filter offload flags'.
-        # Keep one standalone police index shared by TCP/UDP and IPv4/IPv6.
-        run(['tc','actions','add','action','police','rate',f'{rec[direction]*8}bit',
-             'burst',f'{kb}k','conform-exceed','drop/ok','index',str(index),'skip_hw'])
-        for _,_,family,transport,pref,_ in theirs:
+        for n,(_,_,family,transport,pref,_) in enumerate(theirs):
             field='dst_port' if direction=='up' else 'src_port'
-            run(['tc','filter','add','dev',iface,tcdir,'protocol',tc_protocol(family),
+            cmd=['tc','filter','add','dev',iface,tcdir,'protocol',tc_protocol(family),
                  'pref',str(pref),'handle',f'0x{tc_handle(port):x}',
                  'flower','skip_hw','ip_proto',transport,field,str(port),
-                 'action','police','index',str(index)])
+                 'action','police']
+            if n==0:
+                # Kernel atomically creates the policer and attaches filter 1.
+                # skip_hw applies to both flower and action to avoid mismatch.
+                cmd.extend(['rate',f'{rec[direction]*8}bit','burst',f'{kb}k',
+                            'conform-exceed','drop/ok','index',str(index),'skip_hw'])
+            else:cmd.extend(['index',str(index)])
+            run(cmd)
+
+
+def tc_action_exists(index):
+    output=run(['tc','-s','actions','ls','action','police'])
+    return bool(re.search(r'\bpolice\s+0x'+format(index,'x')+r'\b',output,re.I))
+
 
 def tc_snapshot(iface):
     # One coherent read pass per audit/watch invocation, not per customer port.
@@ -618,7 +637,8 @@ def tc_ok(port,rec,iface,snap=None):
                     entry=tc_find(iface,port,direction,family,transport,rec,rows,strict=rec[direction]>0)
                     targets.append((family,transport,entry))
             if rec[direction]==0:
-                if any(entry for _,_,entry in targets):return False
+                if any(entry for _,_,entry in targets) or tc_action_exists(tc_police_index(port,direction)):
+                    return False
                 continue
             if not all(entry for _,_,entry in targets):return False
             text=snap['text'][tcdir] if snap else run(['tc','-s','filter','show','dev',iface,tcdir])
@@ -628,6 +648,8 @@ def tc_ok(port,rec,iface,snap=None):
     except Error:return False
 
 def apply(port,rec,config):
+    if rec['down']>0 and not config.get('tc_enabled'):
+        raise Error('UDP/TCP 下载限速必须使用 tc egress；不可采用 nft-only，以免本地发送程序收到 EPERM')
     if not nft_ok(port,rec):apply_nft(port,rec)
     if config.get('tc_enabled'):
         ensure_tc_prefs(port,rec,config['iface'])
@@ -659,7 +681,8 @@ def listen_ports():
 def audit_one(port,rec,config,nft_items=None,tc_items=None):
     nft=nft_ok(port,rec,nft_items)
     tc=tc_ok(port,rec,config['iface'],tc_items) if config.get('tc_enabled') else None
-    return ('OK' if nft and (tc is None or tc) and not rec.get('pending') else 'STALE',nft,tc)
+    return ('OK' if nft and (tc is None or tc) and not (rec['down']>0 and tc is None)
+            and not rec.get('pending') else 'STALE',nft,tc)
 
 def units():
     exe='/usr/local/sbin/portbw'
