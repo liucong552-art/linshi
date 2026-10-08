@@ -567,10 +567,9 @@ def apply_tc(port,rec,iface):
                     raise Error(f'{port}: {tcdir} pref={pref} 包含外部规则，拒绝修改')
                 old=tc_find(iface,port,direction,family,transport,rec,rows[tcdir])
                 plan.append((direction,tcdir,family,transport,pref,old))
-    # Do not create a *standalone* tc action. Its extra reference can survive
-    # after all flower filters are deleted (Debian 12 reports a failed delete).
-    # Create the shared policer on the first flower, then attach three others.
-    # The action lifetime now follows the flower bindings without global flush.
+    # Create the shared policer on the first flower; the other three share it.
+    # On Debian 12, its last reference can survive all flower deletions as
+    # ref=1 bind=0. Only GC this exact previously verified index once unbound.
     for direction in CHAIN:
         tcdir='ingress' if direction=='up' else 'egress'
         theirs=[p for p in plan if p[0]==direction]
@@ -589,10 +588,11 @@ def apply_tc(port,rec,iface):
         for _,_,family,transport,pref,old in existing:
             run(['tc','filter','del','dev',iface,tcdir,'protocol',tc_protocol(family),
                  'pref',str(pref),'handle',f'0x{tc_handle(port):x}','flower'])
-        # The last flower must release its police action. If another rule
-        # still binds the index, refuse rather than delete another owner's action.
-        if existing and tc_action_exists(index):
-            raise Error(f'{port}: 删除 flower 后 police index {index} 仍存在；拒绝强制清理，请恢复测试快照')
+        # The policer can legitimately outlive all four flower filters.
+        # Never delete an index belonging to somebody else: all former slots
+        # were verified as ours, and only ref=1/bind=0 may be collected.
+        if existing:
+            tc_gc_unbound_police(port,index)
         if rec[direction]==0:continue
         kb=tc_burst_kb(rec[direction])
         for n,(_,_,family,transport,pref,_) in enumerate(theirs):
@@ -610,9 +610,38 @@ def apply_tc(port,rec,iface):
             run(cmd)
 
 
-def tc_action_exists(index):
+def tc_action_block(index):
+    """Return the exact global tc police entry for an action index, if any."""
     output=run(['tc','-s','actions','ls','action','police'])
-    return bool(re.search(r'\bpolice\s+0x'+format(index,'x')+r'\b',output,re.I))
+    heads=list(re.finditer(r'^\s*action order [0-9]+:\s+police\s+0x([0-9a-f]+)\b',
+                           output,re.I|re.M))
+    matches=[i for i,m in enumerate(heads) if int(m.group(1),16)==index]
+    if len(matches)>1:raise Error(f'tc police index {index} 存在重复输出，拒绝修改')
+    if not matches:return None
+    m=heads[matches[0]]
+    following=heads[matches[0]+1].start() if matches[0]+1<len(heads) else len(output)
+    return output[m.start():following]
+
+
+def tc_action_exists(index):
+    return tc_action_block(index) is not None
+
+
+def tc_gc_unbound_police(port,index):
+    """Collect only a formerly attached OWNED policer that is now unbound."""
+    block=tc_action_block(index)
+    if block is None:return
+    counts=re.search(r'\bref\s+([0-9]+)\s+bind\s+([0-9]+)\b',block)
+    if not counts:raise Error(f'{port}: police index {index} 缺少 ref/bind，拒绝删除')
+    refs,binds=map(int,counts.groups())
+    if (refs!=1 or binds!=0 or
+            not re.search(r'\baction\s+drop\b',block) or
+            not re.search(r'^\s*skip_hw\s*$',block,re.M)):
+        raise Error(f'{port}: police index {index} 仍有引用(ref={refs},bind={binds})或属性异常，拒绝删除')
+    # Index-specific deletion is supported by tc-actions(8); NEVER flush all.
+    run(['tc','actions','delete','action','police','index',str(index)])
+    if tc_action_exists(index):
+        raise Error(f'{port}: police index {index} 删除后仍残留，停止修改')
 
 
 def tc_snapshot(iface):

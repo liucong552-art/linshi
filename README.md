@@ -26,7 +26,7 @@ portbw del 45123        # 取消该端口策略（不删除节点）
 
 **计量方式**：同一端口，TCP+UDP、IPv4+IPv6，共享每个方向的总额度；上传和下载分别计量。超限丢包，允许短时突发。仅适用于 VPS 本机接收/发送的 TCP、UDP 流量，**不适用于所有 WG/NAT FORWARD 转发**。
 
-**本次修复**：避免 nftables OUTPUT 超速丢包向 UDP 发包程序返回 `EPERM`；下载方向由 **tc egress 单个共享 policer** 限速、nft 只计数；上传由 nft+tc 共同执行。共享 tc action 由第一条 flower 规则创建，最后一条 flower 删除时同步释放，不再独立创建留下多余引用。`--nft-only` 模式不允许下载限速，避免错误地宣称双向限速有效。
+**本次修复**：避免 nftables OUTPUT 超速丢包向 UDP 发包程序返回 `EPERM`；下载方向由 **tc egress 单个共享 policer** 限速、nft 只计数；上传由 nft+tc 共同执行。共享 tc action 由第一条 flower 创建；删除全部 flower 后如保留了未绑定 action，先核验其 `ref=1`、`bind=0` 和 `skip_hw`，再仅按本端口的 index 删除，绝不清空第三方规则。`--nft-only` 模式不允许下载限速，避免错误地宣称双向限速有效。
 
 ## 真机验收
 
@@ -38,3 +38,5 @@ iperf3 -4 -c 162.211.231.219 -p 45123 -u -b 50M -R -t 20 -O 2
 ```
 
 接收端目标为上传约 10、下载约 20 Mbps；还需单独测试 TCP+UDP 同时满载的合计值。测试 `portbw down 45123 0`、`portbw down 45123 20` 和 `portbw del 45123` 的内核残留与审计结果。**离线检查不代表真机已通过。** 不要手动 `nft flush ruleset` 或 `tc qdisc del dev eth0 root`。
+
+**本轮新增验证**：`portbw down` / `portbw del` 的共享 action 精确回收；内核可能在解绑后暂留 `ref=1,bind=0` 的 police action，允许只删除已核实属于本端口的无绑定对象。当前仅离线验证，需 Debian 12 真机验收。
