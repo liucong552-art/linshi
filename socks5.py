@@ -864,6 +864,7 @@ def ip_ready(n,snaps=None):
 def operate(args):
     action=args.action
     if action=='install':return do_install(args)
+    if action=='add':return do_add(args)
     if action=='migrate-bandlim':return migrate_bandlim(args)
     if action=='run':
         n=node(args.id)
