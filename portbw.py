@@ -628,20 +628,32 @@ def tc_action_exists(index):
 
 
 def tc_gc_unbound_police(port,index):
-    """Collect only a formerly attached OWNED policer that is now unbound."""
-    block=tc_action_block(index)
-    if block is None:return
-    counts=re.search(r'\bref\s+([0-9]+)\s+bind\s+([0-9]+)\b',block)
-    if not counts:raise Error(f'{port}: police index {index} 缺少 ref/bind，拒绝删除')
-    refs,binds=map(int,counts.groups())
-    if (refs!=1 or binds!=0 or
-            not re.search(r'\baction\s+drop\b',block) or
-            not re.search(r'^\s*skip_hw\s*$',block,re.M)):
-        raise Error(f'{port}: police index {index} 仍有引用(ref={refs},bind={binds})或属性异常，拒绝删除')
-    # Index-specific deletion is supported by tc-actions(8); NEVER flush all.
-    run(['tc','actions','delete','action','police','index',str(index)])
-    if tc_action_exists(index):
-        raise Error(f'{port}: police index {index} 删除后仍残留，停止修改')
+    """Wait for tc's deferred flower-action releases; GC only a truly unbound owned index.
+
+    Linux may briefly report ref=1/bind=1 after the fourth flower is deleted.
+    Do not mistake that transient state for a permanent foreign binding.  A
+    STILL-bound action is never force-deleted, even if the timeout expires.
+    """
+    deadline=time.monotonic()+12
+    removed=False
+    while True:
+        block=tc_action_block(index)
+        if block is None:return
+        counts=re.search(r'\bref\s+([0-9]+)\s+bind\s+([0-9]+)\b',block)
+        if not counts:raise Error(f'{port}: police index {index} 缺少 ref/bind，拒绝删除')
+        refs,binds=map(int,counts.groups())
+        if (not re.search(r'\baction\s+drop\b',block) or
+                not re.search(r'^\s*skip_hw\s*$',block,re.M)):
+            raise Error(f'{port}: police index {index} 属性异常，拒绝删除')
+        if not removed and refs==1 and binds==0:
+            # Only this verified, now-unbound index may be deleted; no global flush.
+            run(['tc','actions','delete','action','police','index',str(index)])
+            removed=True
+            continue
+        if time.monotonic()>=deadline:
+            raise Error(f'{port}: police index {index} 等待解绑/回收超时(ref={refs},bind={binds})；'
+                        '未强制删除，请检查 tc 引用')
+        time.sleep(0.25)
 
 
 def tc_snapshot(iface):

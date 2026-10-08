@@ -88,7 +88,7 @@ fi
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='25e4b3bb8209020c4895a3bfabb59ac4dbaba3a9511c9f38a9ece76d268b2844'
+EXPECTED_PORTBW_SHA256='489ffd94b8b6d25f02954e6ce0965cd382098f20155125aeaefb4a9fe3735c14'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'

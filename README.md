@@ -1,6 +1,6 @@
 # portbw — TCP/UDP 同端口合计限速（linshi 测试版）
 
-**只适合恢复到从未安装过 portbw 的 VPS 快照。** 仍在实机验证，不要合并到 `zuizhongheji`。旧版共享 tc action 可能有残留，不能原地升级。
+**linshi 测试版，仍在真机验证，暂勿合并到 `zuizhongheji`。** 当前 45123 在 `down=0` 状态下已确认无下载 action 残留，可原地更新当前测试版；其他旧版本或未知残留不要未经核验直接覆盖。
 
 把这三个文件上传到 `liucong552-art/linshi` 的 `main` 分支**根目录**：`install.sh`、`portbw.py`、`README.md`。
 
@@ -39,4 +39,6 @@ iperf3 -4 -c 162.211.231.219 -p 45123 -u -b 50M -R -t 20 -O 2
 
 接收端目标为上传约 10、下载约 20 Mbps；还需单独测试 TCP+UDP 同时满载的合计值。测试 `portbw down 45123 0`、`portbw down 45123 20` 和 `portbw del 45123` 的内核残留与审计结果。**离线检查不代表真机已通过。** 不要手动 `nft flush ruleset` 或 `tc qdisc del dev eth0 root`。
 
-**本轮新增验证**：`portbw down` / `portbw del` 的共享 action 精确回收；内核可能在解绑后暂留 `ref=1,bind=0` 的 police action，允许只删除已核实属于本端口的无绑定对象。当前仅离线验证，需 Debian 12 真机验收。
+**早期修复**：`portbw down` / `portbw del` 的共享 action 精确回收；内核可能在解绑后暂留 `ref=1,bind=0` 的 police action，允许只删除已核实属于本端口的无绑定对象。当前仅离线验证，需 Debian 12 真机验收。
+
+**本次修复（延迟释放）**：实际 Debian 12 测试发现，4 条 egress flower 删除后仍可能短暂出现下载 policer `ref=1,bind=1`，稍后自行消失。新增最多 12 秒的限时状态轮询：action 自动消失即可完成；确认为 `ref=1,bind=0` 才定点删除；持续绑定或属性异常时拒绝强制清理。尚需 VPS 验证。
