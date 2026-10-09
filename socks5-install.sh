@@ -31,7 +31,7 @@ if [[ "$ACTION" != deps ]];then
     SRC_DIR="$FETCH_DIR"
     echo '[socks5] 从 linshi/main 下载 SOCKS5 两个主体文件...'
   fi
-  expected_core="e93b2eedd169e296a81aadcbdeb646351b6e74d5be61b3a8d8b437fb6a4608e7"
+  expected_core="58edf5d8a2b06281ea4b41675a41656b0091396eaa6551529cd466ed2f9007fd"
   expected_traffic="3c0a882871903d71e74953f46d3181191c84d38bfd08f71a9333dcfed1291dbd"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
   actual_traffic="$(sha256sum "$SRC_DIR/socks5-traffic.py" | awk '{print $1}')"

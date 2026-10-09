@@ -281,7 +281,7 @@ def ready(n,snaps=None):
             if ip_name(p) not in ipobjs:return False
             ips=named_object(isnap,'set',ip_name(p))
             if ips is None or ips.get('size')!=n['ip_limit']:return False
-            if not {'timeout','dynamic'}.issubset(set(ips.get('flags',[]))):return False
+            if 'timeout' not in set(ips.get('flags',[])):return False
             # nft JSON reports timeout in milliseconds on supported releases.
             # Some releases omit it; rely on the persisted pending marker for
             # atomic updates rather than rejecting otherwise healthy sets.
@@ -722,11 +722,12 @@ def do_add(args):
 
 def socks_handshake(n):
     """Fail creation if SOCKS5 authentication or critical ACLs are ineffective."""
+    phase = '正确密码认证'
     def recv_exact(c,count):
         out=b''
         while len(out)<count:
             data=c.recv(count-len(out))
-            if not data:raise Fail('SOCKS5 握手提前断开')
+            if not data:raise Fail(f'SOCKS5 握手提前断开，阶段：{phase}')
             out+=data
         return out
     def login(password):
@@ -745,21 +746,77 @@ def socks_handshake(n):
             return c,reply
         except BaseException:
             c.close();raise
+    phase = 'UDP ASSOCIATE 拒绝检查'
     with contextlib.closing(login(n['password'])[0]) as c:
         # A wrong credential test guarantees the port isn't an open proxy.
         c.sendall(b'\x05\x03\x00\x01'+b'\x00'*4+b'\x00'*2)
-        reply=recv_exact(c,2)
-        if reply[0]!=5 or reply[1]==0:
-            raise Fail('不允许 UDP ASSOCIATE，但实际代理未拒绝')
+        try:
+            reply=recv_exact(c,2)
+        except Fail as exc:
+            if 'SOCKS5 握手提前断开' not in str(exc):raise
+        except ConnectionResetError:
+            pass
+        else:
+            if reply[0]!=5 or reply[1]==0:
+                raise Fail('不允许 UDP ASSOCIATE，但实际代理未拒绝')
+    phase = '127.0.0.1 访问拒绝检查'
     with contextlib.closing(login(n['password'])[0]) as c:
         c.sendall(b'\x05\x01\x00\x01'+bytes([127,0,0,1])+bytes([0,80]))
-        reply=recv_exact(c,2)
-        if reply[0]!=5 or reply[1]==0:
-            raise Fail('目标 127.0.0.1 未被代理访问控制拒绝')
-    c,reply=login(n['password']+'!invalid')
-    with contextlib.closing(c):
-        if reply==b'\x01\x00':raise Fail('SOCKS5 错误密码被接受')
-        if reply[0]!=1:raise Fail('SOCKS5 错误密码检查没有有效响应')
+        try:
+            reply=recv_exact(c,2)
+        except Fail as exc:
+            if 'SOCKS5 握手提前断开' not in str(exc):raise
+        except ConnectionResetError:
+            pass
+        else:
+            if reply[0]!=5 or reply[1]==0:
+                raise Fail('目标 127.0.0.1 未被代理访问控制拒绝')
+    # 3proxy 先回复 RFC1929 01 00，随后在 CONNECT 阶段校验密码。
+    # 必须实际请求公网目标，才能验证错误密码无法使用代理。
+    phase = '公网 CONNECT 认证检查'
+
+    def can_connect(password):
+        try:
+            c, auth_reply = login(password)
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            if password == n['password']:
+                raise Fail(f'正确密码握手连接异常：{type(exc).__name__}: {exc}') from exc
+            return False
+        except Fail as exc:
+            if password != n['password'] and '握手提前断开' in str(exc):
+                return False
+            raise
+
+        with contextlib.closing(c):
+            if auth_reply != bytes([1, 0]):
+                if len(auth_reply) != 2 or auth_reply[0] != 1:
+                    raise Fail('SOCKS5 认证响应格式异常')
+                return False
+
+            request = (
+                bytes([5, 1, 0, 1])
+                + socket.inet_aton('1.1.1.1')
+                + (443).to_bytes(2, 'big')
+            )
+            try:
+                c.sendall(request)
+                reply = recv_exact(c, 2)
+            except (Fail, OSError) as exc:
+                if password == n['password']:
+                    raise Fail(f'正确密码 CONNECT 阶段异常：{type(exc).__name__}: {exc}') from exc
+                return False
+
+            if reply[0] != 5:
+                raise Fail(f'SOCKS5 CONNECT 回复格式异常：{reply.hex()}')
+            if password == n['password'] and reply[1] != 0:
+                raise Fail(f'正确密码 CONNECT 收到拒绝码：REP=0x{reply[1]:02x}')
+            return reply[1] == 0
+
+    if not can_connect(n['password']):
+        raise Fail('正确密码无法 CONNECT 1.1.1.1:443，检查出口网络或 3proxy ACL')
+
+    if can_connect(n['password'] + '!invalid'):
+        raise Fail('安全错误：错误密码可以 CONNECT 公网，拒绝创建账号')
 
 
 def do_del(n, *, stop_post=False):
@@ -829,7 +886,11 @@ def repair_node(n, *, manual_restore=False, snaps=None):
     if ready(n,snaps):
         if manual_restore and n['quota'] is not None:save_quota(n)
         return
-    systemctl('stop',service(n),required=False)
+    # During boot, an inactive instance may have a queued start job.
+    # Do not cancel that job while restoring nft protection.
+    # Stop an already-running proxy before changing its guards.
+    if systemctl('is-active','--quiet',service(n),required=False) is not None:
+        systemctl('stop',service(n),required=False)
     if n.get('pending'):
         try:apply_quota(n)
         except Fail:ensure_block(n);raise
@@ -884,7 +945,8 @@ def operate(args):
             if n['expires']<=int(time.time()):do_del(n,stop_post=True)
         return
     if action in ('save','gc','reset','watch','restore'):
-        with locked(nonblocking=True) as ok:
+        # Explicit save/restore must not silently skip on lock contention.
+        with locked(nonblocking=action in ('gc','reset','watch')) as ok:
             if not ok:return
             ensure_tables()
             failures=[]
