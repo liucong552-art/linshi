@@ -31,7 +31,7 @@ if [[ "$ACTION" != deps ]];then
     SRC_DIR="$FETCH_DIR"
     echo '[socks5] 从 zuizhongheji/main 下载 SOCKS5 两个主体文件...'
   fi
-  expected_core="2ad7c0ce5c3f0c0614140f68951111d43ddc0a739eebd52a058576b0ee6fac0c"
+  expected_core="4e5ea3ef304c49e9815782fd5da75a6c39e823978c4f89d6dcdca01dbb7d23d5"
   expected_traffic="3c0a882871903d71e74953f46d3181191c84d38bfd08f71a9333dcfed1291dbd"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
   actual_traffic="$(sha256sum "$SRC_DIR/socks5-traffic.py" | awk '{print $1}')"

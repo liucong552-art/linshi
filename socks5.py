@@ -300,6 +300,11 @@ def _nft_dynset(expr, mode, name, sticky):
     if set(obj)-{'op','set','elem'}:return False
     elem=obj.get('elem')
     if not isinstance(elem,dict):return False
+    # libnftables on Debian 12 can serialize a dynamic-set element as
+    # {"elem":{"elem":{"val":ip_saddr,"timeout":N}}} rather than a flat elem.
+    # Unwrap exactly one recognized layer; still verify source, set and timeout.
+    if set(elem)=={'elem'} and isinstance(elem['elem'],dict):
+        elem=elem['elem']
     source={'payload':{'protocol':'ip','field':'saddr'}}
     if elem==source:return True
     # nft JSON encodes per-element timeout as seconds or milliseconds depending
@@ -334,17 +339,26 @@ def _nft_rule_valid(rule, n, kind):
             return (len(expr)==4 and _nft_family(expr[0],'ipv4')
                     and _nft_match(expr[1],{'meta':{'key':'iifname'}},'lo')
                     and _nft_tcp_port(expr[2],'dport',port) and _nft_action(expr[3],'accept'))
-        prefix=(len(expr)>2 and _nft_family(expr[0],'ipv4') and _nft_tcp_port(expr[1],'dport',port))
-        if not prefix:return False
-        if kind=='drop':return len(expr)==3 and _nft_action(expr[2],'drop')
-        if kind=='claim':
-            return (len(expr)==4 and _nft_dynset(expr[2],'add',s,n['sticky'])
-                    and _nft_action(expr[3],'accept'))
-        if kind=='refresh':
-            return (len(expr)==5 and _nft_set_member(expr[2],s)
-                    and _nft_dynset(expr[3],'update',s,n['sticky'])
-                    and _nft_action(expr[4],'accept'))
-        return False
+        if kind in ('refresh','claim'):
+            # `ip saddr` and the ipv4_addr dynamic set imply IPv4. Some nft
+            # versions omit the redundant `meta nfproto ipv4` in JSON dumps.
+            # Accept only these two exact canonicalizations, never a wildcard
+            # rule or a changed action, set, source address, port, or timeout.
+            tail=expr[1:] if expr and _nft_family(expr[0],'ipv4') else expr
+            if kind=='claim':
+                return (len(tail)==3 and _nft_tcp_port(tail[0],'dport',port)
+                        and _nft_dynset(tail[1],'add',s,n['sticky'])
+                        and _nft_action(tail[2],'accept'))
+            return (len(tail)==4 and _nft_tcp_port(tail[0],'dport',port)
+                    and _nft_set_member(tail[1],s)
+                    and _nft_dynset(tail[2],'update',s,n['sticky'])
+                    and _nft_action(tail[3],'accept'))
+        # Unlike a dynamic IPv4 set reference, the standalone drop must
+        # retain its explicit IPv4 family guard or it could block IPv6.
+        return (kind=='drop' and len(expr)==3
+                and _nft_family(expr[0],'ipv4')
+                and _nft_tcp_port(expr[1],'dport',port)
+                and _nft_action(expr[2],'drop'))
     chain=Q_IN if kind.endswith('in') else Q_OUT
     field='dport' if chain==Q_IN else 'sport'
     if rule.get('table',TABLE_Q)!=TABLE_Q or rule.get('chain')!=chain:return False

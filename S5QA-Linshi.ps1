@@ -19,7 +19,15 @@ $RemoteDir='/root/s5qa-linshi'
 $RemoteTool="$RemoteDir/s5qa-linshi.sh"
 $QaUrl='https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main/s5qa-linshi.sh'
 # SHA256 of the exact s5qa-linshi.sh shipped with this launcher.
-$QaHash='728cbdaa0634057414b67faaad2a7d79fcff1dd699c1fb03fc9c8e5e15111fb5'
+# The linshi Bash runner in GitHub remains unchanged. After authenticating the
+# exact original SHA, adapt only its two source pins in the temporary Windows
+# copy and verify the final SHA before uploading it to the QA host.
+$OriginalQaHash='728cbdaa0634057414b67faaad2a7d79fcff1dd699c1fb03fc9c8e5e15111fb5'
+$QaHash='0c75b470ba51f9f670e68a5fa1adab485940535c7e29949b8fdfdaedce248ccd'
+$CorePinOld='2ad7c0ce5c3f0c0614140f68951111d43ddc0a739eebd52a058576b0ee6fac0c'
+$CorePinNew='4e5ea3ef304c49e9815782fd5da75a6c39e823978c4f89d6dcdca01dbb7d23d5'
+$InstallPinOld='fd0bd33f5cd126ec34c700d05e0bd8c289ff29c2e1f6f47f9953b29b292bd213'
+$InstallPinNew='8f9e68afbbc68f4d0f243f6037e313b9b5abbfa6b39ed2aac3e906772d584c8a' 
 $SshArgs=@('-i',$KeyFile,'-p',"$SshPort",'-o','BatchMode=yes','-o','ConnectTimeout=10',
            '-o','ServerAliveInterval=10','-o','ServerAliveCountMax=2','-o','StrictHostKeyChecking=yes',$RemoteUser)
 $ScpArgs=@('-i',$KeyFile,'-P',"$SshPort",'-o','BatchMode=yes','-o','ConnectTimeout=10',
@@ -41,7 +49,19 @@ function Upload-Qa {
         & curl.exe -q -fLsS --retry 3 --connect-timeout 10 --max-time 90 -o $tmp $QaUrl
         if ($LASTEXITCODE -ne 0) { throw 'Cannot download s5qa-linshi.sh from linshi' }
         $actual=(Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actual -ne $QaHash) {throw 'QA runner SHA256 mismatch; refusing upload'}
+        if ($actual -ne $OriginalQaHash) {throw 'Original QA runner SHA256 mismatch; refusing upload'}
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $source = [System.IO.File]::ReadAllText($tmp, $utf8)
+        foreach ($pin in @(@{Old=$CorePinOld;New=$CorePinNew},
+                           @{Old=$InstallPinOld;New=$InstallPinNew})) {
+            if ([regex]::Matches($source, [regex]::Escape($pin.Old)).Count -ne 1) {
+                throw 'QA runner pin layout changed; refusing adaptation'
+            }
+            $source = $source.Replace($pin.Old, $pin.New)
+        }
+        [System.IO.File]::WriteAllText($tmp, $source, $utf8)
+        $adapted=(Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($adapted -ne $QaHash) {throw 'Adapted QA runner SHA256 mismatch; refusing upload'}
         Remote-Run "install -d -m 0700 $RemoteDir"
         & scp.exe @ScpArgs $tmp "${RemoteUser}:$RemoteTool" | Out-Host
         if ($LASTEXITCODE -ne 0) { throw 'SCP upload failed' }
