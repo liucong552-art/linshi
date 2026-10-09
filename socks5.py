@@ -262,46 +262,211 @@ def named_object(snapshot,kind,name):
         if isinstance(value,dict) and value.get('name')==name:return value
     return None
 
+def _nft_match(expr, left, right, *, ops=('==',)):
+    """Match one whole nft JSON comparison; never trust rule comments alone."""
+    if not isinstance(expr,dict) or set(expr)!={'match'}:return False
+    item=expr['match']
+    return (isinstance(item,dict) and item.get('op') in ops
+            and item.get('left')==left and item.get('right')==right)
+
+
+def _nft_ref(value, name):
+    if isinstance(value,str):return value.lstrip('@')==name
+    if isinstance(value,dict) and set(value)=={'set'}:
+        return _nft_ref(value['set'],name)
+    return False
+
+
+def _nft_tcp_port(expr, field, port):
+    return _nft_match(expr,{'payload':{'protocol':'tcp','field':field}},port)
+
+
+def _nft_family(expr, family):
+    return _nft_match(expr,{'meta':{'key':'nfproto'}},family)
+
+
+def _nft_action(expr, action):
+    return isinstance(expr,dict) and expr=={action:None}
+
+
+def _nft_named(expr, kind, name):
+    return isinstance(expr,dict) and set(expr)=={kind} and _nft_ref(expr[kind],name)
+
+
+def _nft_dynset(expr, mode, name, sticky):
+    if not isinstance(expr,dict) or set(expr)!={'set'}:return False
+    obj=expr['set']
+    if not isinstance(obj,dict) or obj.get('op')!=mode or not _nft_ref(obj.get('set'),name):return False
+    if set(obj)-{'op','set','elem'}:return False
+    elem=obj.get('elem')
+    if not isinstance(elem,dict):return False
+    source={'payload':{'protocol':'ip','field':'saddr'}}
+    if elem==source:return True
+    # nft JSON encodes per-element timeout as seconds or milliseconds depending
+    # on libnftables version; do not accept a different source expression.
+    if set(elem)-{'val','timeout','expires','comment'}:return False
+    if elem.get('val')!=source:return False
+    timeout=elem.get('timeout')
+    if timeout is not None and timeout not in (sticky,sticky*1000,str(sticky)+'s',str(sticky*1000)):
+        return False
+    return True
+
+
+def _nft_set_member(expr, name):
+    if not isinstance(expr,dict) or set(expr)!={'match'}:return False
+    m=expr['match']
+    return (isinstance(m,dict) and m.get('op') in ('==','in')
+            and m.get('left')=={'payload':{'protocol':'ip','field':'saddr'}}
+            and _nft_ref(m.get('right'),name))
+
+
+def _nft_rule_valid(rule, n, kind):
+    port=n['port']; s=ip_name(port); ci,co,qn=quota_names(port)
+    expr=rule.get('expr')
+    if not isinstance(expr,list):return False
+    if rule.get('family','inet')!='inet':return False
+    if kind in ('local','family','refresh','claim','drop'):
+        if rule.get('table',TABLE_IP)!=TABLE_IP or rule.get('chain')!=IP_CHAIN:return False
+        if kind=='family':
+            return (len(expr)==3 and _nft_family(expr[0],'ipv6') and
+                    _nft_tcp_port(expr[1],'dport',port) and _nft_action(expr[2],'drop'))
+        if kind=='local':
+            return (len(expr)==4 and _nft_family(expr[0],'ipv4')
+                    and _nft_match(expr[1],{'meta':{'key':'iifname'}},'lo')
+                    and _nft_tcp_port(expr[2],'dport',port) and _nft_action(expr[3],'accept'))
+        prefix=(len(expr)>2 and _nft_family(expr[0],'ipv4') and _nft_tcp_port(expr[1],'dport',port))
+        if not prefix:return False
+        if kind=='drop':return len(expr)==3 and _nft_action(expr[2],'drop')
+        if kind=='claim':
+            return (len(expr)==4 and _nft_dynset(expr[2],'add',s,n['sticky'])
+                    and _nft_action(expr[3],'accept'))
+        if kind=='refresh':
+            return (len(expr)==5 and _nft_set_member(expr[2],s)
+                    and _nft_dynset(expr[3],'update',s,n['sticky'])
+                    and _nft_action(expr[4],'accept'))
+        return False
+    chain=Q_IN if kind.endswith('in') else Q_OUT
+    field='dport' if chain==Q_IN else 'sport'
+    if rule.get('table',TABLE_Q)!=TABLE_Q or rule.get('chain')!=chain:return False
+    if not expr or not _nft_tcp_port(expr[0],field,port):return False
+    if kind in ('dropin','dropout'):
+        if n['quota'] is None:return False
+        if quota_remaining(n)==0:
+            return len(expr)==2 and _nft_action(expr[1],'drop')
+        return (len(expr)==3 and _nft_named(expr[1],'quota',qn)
+                and _nft_action(expr[2],'drop'))
+    if kind in ('countin','countout'):
+        if n['quota'] is None or quota_remaining(n)==0:return False
+        return len(expr)==2 and _nft_named(expr[1],'counter',ci if kind=='countin' else co)
+    return False
+
+
+def _nft_base_ok(snap, table):
+    chain_specs=({IP_CHAIN:('input',-10)} if table==TABLE_IP
+                 else {Q_IN:('input',0),Q_OUT:('output',0)})
+    tables=[v['table'] for v in snap if 'table' in v]
+    if len(tables)!=1 or tables[0].get('family')!='inet' or tables[0].get('name')!=table:
+        return False
+    chains=[v['chain'] for v in snap if 'chain' in v]
+    if len(chains)!=len(chain_specs):return False
+    for name,(hook,priority) in chain_specs.items():
+        candidates=[c for c in chains if c.get('name')==name]
+        if len(candidates)!=1:return False
+        c=candidates[0]
+        if (c.get('family','inet')!='inet' or c.get('table',table)!=table
+            or c.get('type')!='filter' or c.get('hook')!=hook
+            or c.get('prio')!=priority or c.get('policy')!='accept'):
+            return False
+    return True
+
+
+def _nft_rules_ok(snap, table, n, expected):
+    """Validate exact expressions and order; reject foreign/wildcard shortcuts."""
+    prefix='s5m-ip-' if table==TABLE_IP else 's5m-q-'
+    port=n['port']
+    selected=[]
+    for index,entry in enumerate(snap):
+        if 'rule' not in entry:continue
+        r=entry['rule']
+        if r.get('family','inet')!='inet' or r.get('table',table)!=table:return False
+        comment=r.get('comment')
+        # These tables are manager-owned: an unrecognized rule could bypass
+        # an earlier/later restriction. Never accept external rules in them.
+        if not isinstance(comment,str) or not re.fullmatch(prefix+r'[0-9]{1,5}-[a-z]+',comment):
+            return False
+        if r.get('chain') not in ({IP_CHAIN} if table==TABLE_IP else {Q_IN,Q_OUT}):return False
+        ruleport=int(comment[len(prefix):].split('-',1)[0])
+        if not 1<=ruleport<=65535:return False
+        if ruleport==port:
+            if type(r.get('handle')) is not int:return False
+            kind=comment.rsplit('-',1)[1]
+            if kind not in expected or not _nft_rule_valid(r,n,kind):return False
+            selected.append((index,kind))
+        else:
+            # A rule claiming another port must actually match that port,
+            # never a wildcard or our port (which could grant early accept).
+            expr=r.get('expr')
+            if not isinstance(expr,list):return False
+            if table==TABLE_IP:
+                if not any(_nft_tcp_port(x,'dport',ruleport) for x in expr):return False
+            elif not any(_nft_tcp_port(x,'dport' if r['chain']==Q_IN else 'sport',ruleport) for x in expr):
+                return False
+    return [kind for _,kind in selected]==list(expected)
+
+
+def _nft_ip_ok(n, snap):
+    if not _nft_base_ok(snap,TABLE_IP):return False
+    expected=(('local','family','refresh','claim','drop') if n['ip_limit'] else ('family',))
+    if not _nft_rules_ok(snap,TABLE_IP,n,expected):return False
+    matching=[v['set'] for v in snap if 'set' in v and v['set'].get('name')==ip_name(n['port'])]
+    if not n['ip_limit']:return not matching
+    if len(matching)!=1:return False
+    s=matching[0]
+    if s.get('type')!='ipv4_addr' or s.get('size')!=n['ip_limit']:return False
+    flags=s.get('flags',[])
+    if isinstance(flags,str):flags=[flags]
+    # Older libnftables versions omit the dynamic flag in JSON dumps.
+    if 'timeout' not in flags or 'constant' in flags:return False
+    timeout=s.get('timeout')
+    if timeout is not None and timeout not in (n['sticky'],n['sticky']*1000,str(n['sticky'])+'s',str(n['sticky']*1000)):
+        return False
+    return True
+
+
+def _nft_quota_ok(n, snap):
+    if not _nft_base_ok(snap,TABLE_Q):return False
+    remain=quota_remaining(n)
+    expected=(('dropin','countin','dropout','countout') if remain is not None and remain>0
+              else ('dropin','dropout') if remain==0 else ())
+    # Rule evaluation order is per chain, not across the two base chains.
+    # _nft_rules_ok uses full nft dump order, generally preserving per-chain order.
+    if not _nft_rules_ok(snap,TABLE_Q,n,expected):return False
+    ci,co,qn=quota_names(n['port'])
+    found={}
+    for objkind in ('counter','quota'):
+        for v in snap:
+            x=v.get(objkind)
+            if isinstance(x,dict) and x.get('name') in (ci,co,qn):
+                if x['name'] in found:return False
+                found[x['name']]=(objkind,x)
+    if remain is None or remain==0:return not found
+    if set(found)!={ci,co,qn}:return False
+    if found[ci][0]!='counter' or found[co][0]!='counter' or found[qn][0]!='quota':return False
+    q=found[qn][1]
+    if q.get('bytes')!=remain or q.get('inv') is not True:return False
+    if type(q.get('used',0)) is not int or q.get('used',0)<0:return False
+    return all(type(found[name][1].get('bytes')) is int and found[name][1]['bytes']>=0
+               for name in (ci,co))
+
+
 def ready(n,snaps=None):
-    if n.get('pending') or n.get('pending_ip') or n.get('phase') not in ('active','creating'): return False
+    if n.get('pending') or n.get('pending_ip') or n.get('phase') not in ('active','creating'):
+        return False
     try:
         if snaps is None:snaps=snapshot_pair()
-        isnap=snaps[TABLE_IP];qsnap=snaps[TABLE_Q]
-        iprules,ipobjs=owned_objects(TABLE_IP,n['port'],'s5m-ip-',isnap)
-        qrules,qobjs=owned_objects(TABLE_Q,n['port'],'s5m-q-',qsnap)
-        ipcomments=[v['rule'].get('comment') for v in isnap if 'rule' in v and v['rule'].get('comment','').startswith(f's5m-ip-{n["port"]}-')]
-        qcomments=[v['rule'].get('comment') for v in qsnap if 'rule' in v and v['rule'].get('comment','').startswith(f's5m-q-{n["port"]}-')]
-        p=n['port']
-        if f's5m-ip-{p}-failsafe' in ipcomments:return False
-        if f's5m-ip-{p}-family' not in ipcomments:return False
-        if n['ip_limit'] and not all(f's5m-ip-{p}-{k}' in ipcomments for k in ('refresh','claim','drop')):return False
-        if n['ip_limit'] and f's5m-ip-{p}-local' not in ipcomments:return False
-        if len(iprules)!=(5 if n['ip_limit'] else 1):return False
-        if n['ip_limit']:
-            if ip_name(p) not in ipobjs:return False
-            ips=named_object(isnap,'set',ip_name(p))
-            if ips is None or ips.get('size')!=n['ip_limit']:return False
-            if 'timeout' not in set(ips.get('flags',[])):return False
-            # nft JSON reports timeout in milliseconds on supported releases.
-            # Some releases omit it; rely on the persisted pending marker for
-            # atomic updates rather than rejecting otherwise healthy sets.
-            timeout=ips.get('timeout')
-            if timeout is not None:
-                valid={n['sticky'],n['sticky']*1000,str(n['sticky'])+'s',str(n['sticky']*1000)}
-                if timeout not in valid:return False
-        elif ipobjs:return False
-        if n['quota'] is not None:
-            names=['dropin','dropout'] if quota_remaining(n)==0 else ['dropin','dropout','countin','countout']
-            if not all(f's5m-q-{p}-{k}' in qcomments for k in names): return False
-            if len(qrules)!=len(names):return False
-            if quota_remaining(n)>0:
-                if not all(k in qobjs for k in quota_names(p)):return False
-                obj=named_object(qsnap,'quota',quota_names(p)[2])
-                if obj is None or obj.get('bytes')!=quota_remaining(n):return False
-            elif qobjs:return False
-        elif qrules or qobjs: return False
-        return True
-    except (Fail,ValueError,KeyError,TypeError):return False
+        return _nft_ip_ok(n,snaps[TABLE_IP]) and _nft_quota_ok(n,snaps[TABLE_Q])
+    except (Fail,ValueError,TypeError,KeyError,IndexError,AttributeError):return False
+
 
 def read_nft_named(kind,name):
     out=cmd(['nft','-j','list',kind,'inet',TABLE_Q,name],required=False)
@@ -566,7 +731,7 @@ def do_install(args):
         for n in existing:
             existing_cfg=proxycfg(n['id'])
             if existing_cfg.is_file() and any(k in existing_cfg.read_text() for k in ('bandlimin ', 'bandlimout ')):
-                raise Fail(f'检测到旧版内置限速：{n["id"]}；请先迁移，再升级')
+                raise Fail(f'检测到非本正式版的旧 SOCKS5 内置限速配置：{n["id"]}；拒绝直接升级，以避免意外放宽限速')
         try:
             atomic_json(settings_path,s)
             for path,body in targets.items(): atomic_write(path,body,0o644)
@@ -581,7 +746,10 @@ def do_install(args):
                     systemctl('stop',service(n),required=False)
                     continue
                 repair_node(n,manual_restore=True)
-            systemctl('start','socks5-restore.service')
+            # The restore unit calls `socks5 restore`, which acquires the
+            # same manager lock held by do_install(). Do NOT start it while
+            # holding that lock: blocking restore would deadlock the install.
+            # Unit is enabled here; start it synchronously after lock release.
             for name in ('socks5-save.timer','socks5-gc.timer','socks5-reset.timer','socks5-watch.timer','socks5-shutdown.service'):
                 systemctl('start',name)
             if (CONF/'ddns.json').exists():systemctl('start','socks5-ddns.timer')
@@ -605,7 +773,10 @@ def do_install(args):
                 else:
                     systemctl('stop',unit,required=False)
             raise
-        print(f'安装成功。WAN_IF={wan}，公网地址={host}；不会更改 WG 配置或规则。')
+    # Release manager.lock before starting the restore oneshot. Its ExecStart
+    # obtains the manager lock too, so this is a required lock-order boundary.
+    systemctl('start','socks5-restore.service')
+    print(f'安装成功。WAN_IF={wan}，公网地址={host}；不会更改 WG 配置或规则。')
 
 def free_port(start,end,excluded=None,existing=None):
     occupied={n['port'] for n in (nodes() if existing is None else existing)} | set(excluded or ())
@@ -910,29 +1081,23 @@ def repair_node(n, *, manual_restore=False, snaps=None):
     if not ready(n):raise Fail(f'{n["id"]} 防护恢复后校验仍未通过')
 
 def ip_ready(n,snaps=None):
-    """Check only the independently managed IP guard."""
+    """Inspect the real IP guard expressions, verdicts, order and set schema."""
     try:
         snap=nft_table(TABLE_IP) if snaps is None else snaps[TABLE_IP]
-        port=n['port'];comments=[v['rule'].get('comment') for v in snap
-              if 'rule' in v and str(v['rule'].get('comment','')).startswith(f's5m-ip-{port}-')]
-        if f's5m-ip-{port}-family' not in comments or f's5m-ip-{port}-failsafe' in comments:return False
-        if n['ip_limit']==0:return len(comments)==1 and named_object(snap,'set',ip_name(port)) is None
-        if not all(f's5m-ip-{port}-{suffix}' in comments for suffix in ('local','refresh','claim','drop')):return False
-        item=named_object(snap,'set',ip_name(port))
-        return item is not None and item.get('size')==n['ip_limit']
-    except (Fail,TypeError,KeyError,ValueError):return False
+        return _nft_ip_ok(n,snap)
+    except (Fail,TypeError,KeyError,ValueError,IndexError,AttributeError):return False
+
 
 def operate(args):
     action=args.action
     if action=='install':return do_install(args)
     if action=='add':return do_add(args)
-    if action=='migrate-bandlim':return migrate_bandlim(args)
     if action=='run':
         n=node(args.id)
         if n['expires']<=int(time.time()):return
         if not ready(n):raise Fail('防护不完整，拒绝启动 SOCKS5')
         s=settings();validate_iface(s['wan_if']);local_route(s['wan_if'])
-        if not proxycfg(args.id).exists():raise Fail('SOCKS5 配置不存在')
+        verify_proxycfg(n)  # Never start 3proxy with a modified/unaudited ACL.
         seconds=max(0,n['expires']-int(time.time()))
         if not seconds:return
         # timeout enforces exact epoch while GC performs final cleanup.
@@ -945,9 +1110,18 @@ def operate(args):
             if n['expires']<=int(time.time()):do_del(n,stop_post=True)
         return
     if action in ('save','gc','reset','watch','restore'):
-        # Explicit save/restore must not silently skip on lock contention.
-        with locked(nonblocking=action in ('gc','reset','watch')) as ok:
-            if not ok:return
+        # save/restore block as before. Watchdog must not silently skip a
+        # whole minute when GC or a short management operation owns the lock.
+        # Keep gc/reset nonblocking to avoid overlapping expensive jobs.
+        lock_started=time.monotonic()
+        with locked(wait=20 if action=='watch' else 90,
+                    nonblocking=action in ('gc','reset')) as ok:
+            if not ok:
+                if action in ('gc','reset'):
+                    print(f'{action}: skipped: management lock busy', flush=True)
+                return
+            if action=='watch':
+                print(f'watchdog: lock acquired, waited {time.monotonic()-lock_started:.2f}s', flush=True)
             ensure_tables()
             failures=[]
             try:snaps=snapshot_pair()
@@ -969,8 +1143,12 @@ def operate(args):
                             continue
                         repair_node(n,manual_restore=(action=='restore'),snaps=snaps)
                         if action=='watch' and ready(n) and systemctl('is-active','--quiet',service(n),required=False) is None:
+                            print(f'watchdog: restarting {n["id"]} port={n["port"]}', flush=True)
                             systemctl('reset-failed',service(n),required=False)
                             systemctl('start',service(n))
+                            if systemctl('is-active','--quiet',service(n),required=False) is None:
+                                raise Fail(f'watchdog: {n["id"]} restart returned but unit not active')
+                            print(f'watchdog: recovered {n["id"]} port={n["port"]}', flush=True)
                         if action=='restore':snaps=None  # subsequent nodes may need fresh state
                 except Exception as e:
                     failures.append(f'{n["id"]}: {e}')
@@ -1034,46 +1212,6 @@ def operate(args):
             print('已取消流量配额');return
         raise Fail('未知命令')
 
-
-def migrate_bandlim(args):
-    """Explicit migration path from the older SOCKS5 bundle with bandlim rules.
-
-    Requires a live independently verified portbw rule at least as restrictive
-    as the old built-in 3proxy speed cap. Does not touch VLESS or WG.
-    """
-    if not args.confirm:raise Fail('必须显式使用 --confirm，且先安装 portbw 并设置同端口限速')
-    with locked():
-        n=node(args.id)
-        file=proxycfg(n['id'])
-        old=file.read_bytes()
-        content=old.decode('utf8')
-        old_up=re.search(r'^bandlimin ([0-9]+)\s',content,re.M)
-        old_down=re.search(r'^bandlimout ([0-9]+)\s',content,re.M)
-        if not old_up and not old_down:
-            print('无需迁移：旧配置没有内置限速');return
-        # Bound to an actual independent portbw policy, not to absence of errors
-        # from one UI query. Refuse incomplete/pending policies.
-        bwpath=Path('/var/lib/portbw/ports')/f'{n["port"]}.json'
-        bwp=load(bwpath)
-        if bwp.get('port')!=n['port'] or bwp.get('pending') or bwp.get('deleting'):
-            raise Fail('portbw 限速状态不完整，停止迁移')
-        for key,prior in (('up',old_up),('down',old_down)):
-            if prior and (not isinstance(bwp.get(key),int) or bwp[key]<=0 or bwp[key]*8>int(prior.group(1))):
-                raise Fail(f'端口 {n["port"]} portbw {key} 方向不够严格，拒绝移除原来的 3proxy 限速')
-        actual=cmd(['/usr/local/sbin/portbw','show',str(n['port'])])
-        if not any(line.split() and line.split()[0]==str(n['port']) and line.split()[-1]=='OK' for line in actual.splitlines()):
-            raise Fail('portbw 内核双层实际状态未验证为 OK，拒绝迁移')
-        try:
-            make_user(n,settings())
-            systemctl('restart',service(n))
-            socks_handshake(n)
-            n.pop('up_mbit',None);n.pop('down_mbit',None)
-            atomic_json(nodefile(n['id']),n)
-        except Exception:
-            atomic_write(file,old)
-            systemctl('restart',service(n),required=False)
-            raise
-        print(f'{n["id"]}: 3proxy 内置限速已拆除；当前端口 {n["port"]} 改由独立 portbw 管理')
 
 
 def ddns_set(args):
@@ -1166,7 +1304,6 @@ def parser():
         p=sub.add_parser(name);p.add_argument('id')
         if name=='show':p.add_argument('--credentials',action='store_true')
     p=sub.add_parser('ip-set');p.add_argument('id');p.add_argument('ip_limit');p.add_argument('sticky',nargs='?')
-    p=sub.add_parser('migrate-bandlim');p.add_argument('id');p.add_argument('--confirm',action='store_true')
     p=sub.add_parser('pq-set');p.add_argument('id');p.add_argument('quota_gib');p.add_argument('--confirm-reset',action='store_true')
     return ap
 

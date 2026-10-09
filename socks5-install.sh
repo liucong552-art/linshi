@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Standalone SOCKS5 installer for linshi test repo; no portbw or VLESS changes.
+# Standalone SOCKS5 installer for zuizhongheji production repo; no portbw or VLESS changes.
 set -Eeuo pipefail
 umask 077
 [[ ${EUID:-999} -eq 0 ]] || { echo '请使用 root' >&2; exit 1; }
@@ -11,7 +11,7 @@ case "$ACTION" in
   *) echo '用法：bash socks5-install.sh install --wan-if eth0 --host 1.2.3.4 | update | deps' >&2;exit 2;;
 esac
 
-# Sources may be next to the local installer, or fetched from linshi/main.
+# Sources may be next to the local installer, or fetched from zuizhongheji/main.
 # SHA256 pinning prevents mixing a new installer with an old manager.
 FETCH_DIR=''
 fetch_cleanup(){
@@ -25,13 +25,13 @@ if [[ "$ACTION" != deps ]];then
     command -v curl >/dev/null || { echo '缺少 curl；请先安装 curl ca-certificates' >&2;exit 1; }
     FETCH_DIR="$(mktemp -d /tmp/socks5-source.XXXXXXXX)"
     chmod 0700 "$FETCH_DIR"
-    RAW='https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main'
+    RAW='https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main'
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5.py" -o "$FETCH_DIR/socks5.py"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5-traffic.py" -o "$FETCH_DIR/socks5-traffic.py"
     SRC_DIR="$FETCH_DIR"
-    echo '[socks5] 从 linshi/main 下载 SOCKS5 两个主体文件...'
+    echo '[socks5] 从 zuizhongheji/main 下载 SOCKS5 两个主体文件...'
   fi
-  expected_core="58edf5d8a2b06281ea4b41675a41656b0091396eaa6551529cd466ed2f9007fd"
+  expected_core="2ad7c0ce5c3f0c0614140f68951111d43ddc0a739eebd52a058576b0ee6fac0c"
   expected_traffic="3c0a882871903d71e74953f46d3181191c84d38bfd08f71a9333dcfed1291dbd"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
   actual_traffic="$(sha256sum "$SRC_DIR/socks5-traffic.py" | awk '{print $1}')"
@@ -113,6 +113,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 for idx in "${!TARGETS[@]}";do
   path="${TARGETS[$idx]}"
+  [[ ! -L "$path" ]] || { echo "拒绝覆盖符号链接：$path" >&2;exit 1; }
   if [[ -e "$path" || -L "$path" ]];then
     cp -a -- "$path" "$TX/$idx.old";: >"$TX/$idx.present"
   else
