@@ -802,8 +802,18 @@ def commit(port,up,down,config,deleting=False,auto=None):
 # Sampler observations are cached under /run/portbw/auto to avoid disk churn.
 # Older static records need no migration; corrupt state is not guessed.
 AUTO_VERSION=1
-MIN_SAMPLE=15.0
+# Do not trust sub-half-second measurements or long averaged windows.
+MIN_SAMPLE=0.5
 MAX_SAMPLE_GAP=75.0
+FAST_MAX_SAMPLE_GAP=8.0
+
+
+def max_sample_gap(options):
+    # Preserve original tolerance for legacy >=60s policies. For short
+    # thresholds a long averaged interval is not evidence of uninterrupted
+    # second-level load; reject it and build a new sampling baseline.
+    after=options['after']
+    return MAX_SAMPLE_GAP if after>=60 else max(FAST_MAX_SAMPLE_GAP, min(MAX_SAMPLE_GAP, after*1.5))
 MAX_QUERY_TIME=2.0
 MAX_DURATION=30*86400
 
@@ -842,7 +852,7 @@ def auto_options(args):
     for d in CHAIN:
         if not 0<limited[d]<base[d]:raise Error('自动模式两方向必须满足 0 < 降速值 < 基础速度')
     return {'version':AUTO_VERSION,'base':base,'limited':limited,'trigger_bp':int(trigger*100),
-            'after':duration(args.after,60),'hold':duration(args.hold),
+            'after':duration(args.after,1),'hold':duration(args.hold),
             'cooldown':duration(args.cooldown,0)}
 
 
@@ -878,7 +888,7 @@ def validate_record(port,rec):
     a=rec['auto'];rt=rec.get('runtime')
     if (not isinstance(a,dict) or type(a.get('version')) is not int or a['version']!=AUTO_VERSION
         or type(a.get('trigger_bp')) is not int or not 1<=a['trigger_bp']<=10000):bad()
-    for k,minimum in (('after',60),('hold',1),('cooldown',0)):
+    for k,minimum in (('after',1),('hold',1),('cooldown',0)):
         if type(a.get(k)) is not int or not minimum<=a[k]<=MAX_DURATION:bad()
     for k in ('base','limited'):
         if not isinstance(a.get(k),dict) or set(a[k])!=set(CHAIN):bad()
@@ -1019,7 +1029,8 @@ def observe(s,sample,base,options):
     birth_lo=max(sample['birth_lo'],previous['birth_lo'])
     birth_hi=min(sample['birth_hi'],previous['birth_hi'])
     reason=None
-    if not MIN_SAMPLE<=low or high>MAX_SAMPLE_GAP:reason='采样间隔异常/延迟，重新累计'
+    max_gap=max_sample_gap(options)
+    if not MIN_SAMPLE<=low or high>max_gap:reason='采样间隔异常/延迟，重新累计'
     elif sample['generation']!=previous['generation'] or birth_lo>birth_hi:reason='内核规则重建，重新累计'
     elif sample['bytes']<previous['bytes']:reason='计数器清零/回绕，重新累计'
     if reason:
@@ -1201,7 +1212,7 @@ def auto_operate(args,config):
     print(f'阈值={a["trigger_bp"]/100:g}% 连续={a["after"]}s 保护={a["hold"]}s 冷却={a["cooldown"]}s')
     for d,s in rt['dirs'].items():
         age=max(0,now-s['last']['end']) if same_boot and s['last'] else None
-        fresh=age is not None and age<=MAX_SAMPLE_GAP and state=='OK'
+        fresh=age is not None and age<=max_sample_gap(a) and state=='OK'
         measured=f'{s["mbps"]:.4f}' if fresh and s['mbps'] is not None else '不可用/过期'
         lower=f'{s["lower_mbps"]:.4f}' if fresh and s['lower_mbps'] is not None else '不可用'
         remain=max(0,s['until']-now) if same_boot and s['until'] is not None else None
@@ -1257,12 +1268,12 @@ TimeoutStartSec=120
 UMask=0077
 ''',
     'portbw-watch.timer':'''[Unit]
-Description=Check port bandwidth policies every 30 seconds
+Description=Check port bandwidth policies every 1 second (best-effort)
 
 [Timer]
 OnBootSec=20s
-OnUnitInactiveSec=30s
-AccuracySec=1s
+OnUnitInactiveSec=1s
+AccuracySec=100ms
 Unit=portbw-watch.service
 
 [Install]

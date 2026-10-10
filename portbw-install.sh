@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# portbw v5 real-host TEST candidate; support local pair or remote bootstrap from linshi/main.
+# portbw v5.1 second-resolution TEST candidate; support local pair or remote bootstrap from linshi/main.
 # Always check the exact embedded SHA256 before installing Python payload.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
@@ -15,7 +15,7 @@ usage() {
   bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main/portbw-install.sh) [install|update] [--iface eth0]
 
 Debian/Ubuntu + systemd + root：自动补齐依赖、核对源码哈希、识别默认路由网卡，
-并安装 nft + tc 双层限速、开机恢复服务和每30秒自检 timer。
+并安装 nft + tc 双层限速、开机恢复服务和每1秒自检 timer（best effort）。
 已有配置和端口规则保留。--nft-only 必须手动指定，不会静默降级。
 HELP
 }
@@ -92,7 +92,7 @@ done
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='57d99b8488651b00fb63aa8853ee93f27990f9bfea5ca7e36dfc97acd8e7019f'
+EXPECTED_PORTBW_SHA256='1f697acfbb22822a5c86216b96b4f006c31bdd2e60baea2177c9da3503533179'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'

@@ -226,7 +226,7 @@ class PersistenceAndCLITests(Base):
     def test_invalid_parameters(self):
         cases=[{'trigger':v} for v in ('0','101','NaN','Infinity','-1','90.001')]
         cases += [{k:v} for k in ('up','down','auto_up','auto_down') for v in ('0','-1','NaN','Infinity','bad','0.001')]
-        cases += [{'auto_up':'10'},{'auto_down':'30'},{'after':'30s'},{'after':'1.5m'},
+        cases += [{'auto_up':'10'},{'auto_down':'30'},{'after':'0s'},{'after':'1.5m'},
                   {'hold':'0s'},{'hold':'10'},{'cooldown':'-1s'},{'after':'31d'}]
         for kw in cases:
             with self.subTest(kw=kw),self.assertRaises(p.Error):options(**kw)
@@ -772,3 +772,118 @@ class DamagedSiblingRegressionTests(Base):
         self.assertFalse(saved['pending'])
 
 if __name__=='__main__':unittest.main(verbosity=2)
+
+
+class SecondResolutionTests(Base):
+    """Regression tests for the 1-second timer and short continuous windows."""
+
+    def test_one_second_is_valid_and_zero_is_not(self):
+        for value in ('1s','2s','4s','30s','60s'):
+            with self.subTest(after=value):
+                self.assertEqual(options(after=value)['after'],p.duration(value))
+                r=record(after=value)
+                p.validate_record(40001,r)
+        with self.assertRaises(p.Error): options(after='0s')
+        broken=record(after='1s')
+        broken['auto']['after']=0
+        with self.assertRaises(p.Error):p.validate_record(40001,broken)
+
+    def test_one_second_can_trigger_after_valid_measured_window(self):
+        r=record(after='1s')
+        self.tick(r,100,0,0)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'monitor')
+        self.tick(r,101,1250000,0)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'hold')
+        self.assertEqual(r['up'],625000)
+        self.assertEqual(r['runtime']['dirs']['up']['until'],191)
+        self.assertEqual(r['down'],2500000)
+
+    def test_four_seconds_needs_four_continuous_valid_intervals(self):
+        r=record(after='4s')
+        self.tick(r,100,0,0)
+        for i in (1,2,3):
+            self.tick(r,100+i,i*1250000,0)
+            self.assertEqual(r['up'],1250000)
+            self.assertEqual(r['runtime']['dirs']['up']['progress'],i)
+        self.tick(r,104,5000000,0)
+        self.assertEqual(r['up'],625000)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'hold')
+        self.assertEqual(r['down'],2500000)
+
+    def test_four_seconds_restart_continuity_after_low_traffic(self):
+        r=record(after='4s')
+        self.tick(r,100,0,0)
+        self.tick(r,101,1250000,0)
+        self.tick(r,102,2500000,0)
+        self.tick(r,103,2600000,0)
+        self.assertEqual(r['runtime']['dirs']['up']['progress'],0)
+        for t,bytes_sent in ((104,3850000),(105,5100000),(106,6350000),(107,7600000)):
+            self.tick(r,t,bytes_sent,0)
+            if t<107:self.assertEqual(r['up'],1250000)
+        self.assertEqual(r['up'],625000)
+
+    def test_short_window_rejects_false_positive_from_wide_read(self):
+        s=p.empty_direction();o=options(after='1s')
+        p.observe(s,sample(100,0,width=0.8),o['base']['up'],o)
+        p.observe(s,sample(101.8,1250000,width=0.8),o['base']['up'],o)
+        # Naive 1-second average appears high but conservative time range is 1.8s.
+        self.assertEqual(s['phase'],'monitor')
+        self.assertEqual(s['progress'],0)
+        self.assertLess(s['lower_mbps'],o['base']['up']*o['trigger_bp']*8/10000/1e6)
+
+    def test_short_window_rejects_too_fast_and_stalled_sampling(self):
+        r=record(after='1s')
+        self.tick(r,100,0,0)
+        self.tick(r,100.3,500000,0)
+        self.assertEqual(r['runtime']['dirs']['up']['progress'],0)
+        self.assertIsNone(r['runtime']['dirs']['up']['mbps'])
+        # A 9-second stall cannot pretend to represent a reliable one-second streak.
+        self.tick(r,109.3,12000000,0)
+        self.assertEqual(r['runtime']['dirs']['up']['progress'],0)
+        self.assertEqual(r['up'],1250000)
+        self.assertIn('间隔',r['runtime']['dirs']['up']['reason'])
+
+    def test_hold_and_cooldown_are_not_shortened_by_fast_sampler(self):
+        r=record(after='1s',hold='2m',cooldown='60s')
+        self.tick(r,100,0,0)
+        self.tick(r,101,1250000,0)
+        self.assertEqual(r['runtime']['dirs']['up']['until'],221)
+        self.tick(r,220,2000000,0)
+        self.assertEqual(r['up'],625000)
+        self.tick(r,221,2000000,0)
+        self.assertEqual(r['up'],1250000)
+        self.assertEqual(r['runtime']['dirs']['up']['until'],281)
+
+    def test_oneshot_timer_runs_again_after_1_second_and_no_root_qdisc(self):
+        units=p.units()
+        timer=units['portbw-watch.timer']
+        self.assertIn('OnUnitInactiveSec=1s',timer)
+        self.assertIn('AccuracySec=100ms',timer)
+        self.assertNotIn('OnUnitInactiveSec=30s',timer)
+        self.assertIn('ExecStart=/usr/local/sbin/portbw watch',units['portbw-watch.service'])
+        self.assertNotIn('tc qdisc replace',timer)
+
+class FastWatchIntegrationTests(Base):
+    setup_kernel=WatchIntegrationTests.setup_kernel
+
+    def test_full_watch_path_four_seconds_with_volatile_continuity(self):
+        self.setup_kernel({40001:record(after='4s')})
+        def traffic_sample(port,d,rec,snapshot,nft_items):
+            return sample(self.now,(self.now-100)*(1250000 if d=='up' else 0))
+        with patch.object(p,'traffic_snapshot',return_value={}),\
+             patch.object(p,'traffic_sample',side_effect=traffic_sample):
+            for t in range(100,104):
+                self.now=float(t);p.reconcile(self.config,monitor=True)
+                self.assertEqual(p.records()[40001]['up'],1250000)
+            self.now=104.0;p.reconcile(self.config,monitor=True)
+        state=p.records()[40001]
+        self.assertEqual(state['up'],625000)
+        self.assertFalse(state['pending'])
+        self.assertEqual(state['runtime']['dirs']['up']['phase'],'hold')
+
+    def test_adaptive_gaps_preserve_legacy_but_limit_fast_windows(self):
+        self.assertEqual(p.max_sample_gap(options(after='1s')),8.0)
+        self.assertEqual(p.max_sample_gap(options(after='4s')),8.0)
+        self.assertEqual(p.max_sample_gap(options(after='30s')),45.0)
+        self.assertEqual(p.max_sample_gap(options(after='60s')),75.0)
+        self.assertEqual(p.max_sample_gap(options(after='90s')),75.0)
