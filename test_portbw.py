@@ -563,6 +563,121 @@ systemctl() {{
 
 
 
+class SystemdStartLimitRegressionTests(Base):
+    """Regression for real Debian 12 v5.1 start-limit-hit at 1s cadence."""
+
+    def _install_with_systemd(self, effective):
+        original_exists=Path.exists
+        def exists(path):
+            return True if str(path)=='/run/systemd/system' else original_exists(path)
+        calls=[]
+        def fake_run(cmd,**kwargs):
+            calls.append(cmd)
+            if cmd[:2]==['systemctl','show']:
+                return effective
+            if cmd[:2]==['systemctl','is-enabled']:
+                return 'disabled\n'
+            if cmd[:2]==['systemctl','is-active']:
+                return 'inactive\n'
+            return ''
+        with patch.object(Path,'exists',exists),patch.object(p.shutil,'which',return_value='/mock'),\
+             patch.object(p,'run',side_effect=fake_run),patch.object(p,'tc_qdiscs',return_value=[]),\
+             patch.object(p,'ensure_base',return_value=[]),patch.object(p,'tc_prepare'):
+            p.install(argparse.Namespace(iface='eth0',nft_only=False))
+        return calls
+
+    def test_new_install_confirms_effective_disabled_limit_and_resets_old_failures(self):
+        calls=self._install_with_systemd('StartLimitIntervalUSec=0\n')
+        self.assertIn(['systemctl','show','portbw-watch.service',
+                       '-p','StartLimitIntervalUSec'],calls)
+        self.assertIn(['systemctl','reset-failed','portbw-watch.service'],calls)
+        self.assertLess(calls.index(['systemctl','reset-failed','portbw-watch.service']),
+                        calls.index(['systemctl','start','portbw-watch.timer']))
+        self.assertIn('StartLimitIntervalSec=0',
+                      (p.UNITS/'portbw-watch.service').read_text())
+        self.assertIn('OnUnitInactiveSec=1s',
+                      (p.UNITS/'portbw-watch.timer').read_text())
+
+    def test_effective_default_or_bad_dropin_refused_with_unit_rollback(self):
+        original_exists=Path.exists
+        def exists(path):
+            return True if str(path)=='/run/systemd/system' else original_exists(path)
+        config_before=p.cfg()
+        for name in p.units():p.write_atomic(p.UNITS/name,b'old unit\n')
+        calls=[]
+        def fake_run(cmd,**kwargs):
+            calls.append(cmd)
+            if cmd[:2]==['systemctl','show']:
+                return 'StartLimitIntervalUSec=10s\n'
+            if cmd[:2]==['systemctl','is-enabled']:
+                return 'enabled\n'
+            if cmd[:2]==['systemctl','is-active']:
+                return 'inactive\n'
+            return ''
+        with patch.object(Path,'exists',exists),patch.object(p.shutil,'which',return_value='/mock'),\
+             patch.object(p,'run',side_effect=fake_run),patch.object(p,'tc_qdiscs',return_value=[]),\
+             patch.object(p,'ensure_base',return_value=[]),patch.object(p,'tc_prepare'),\
+             self.assertRaisesRegex(p.Error,'启动频率限制未关闭'):
+            p.install(argparse.Namespace(iface='eth0',nft_only=False))
+        self.assertEqual(p.cfg(),config_before)
+        for name in p.units():
+            self.assertEqual((p.UNITS/name).read_bytes(),b'old unit\n')
+        self.assertNotIn(['systemctl','reset-failed','portbw-watch.service'],calls)
+        self.assertGreaterEqual(calls.count(['systemctl','daemon-reload']),2)
+
+    def test_shell_installer_rolls_back_if_limit_not_zero(self):
+        # Simulate a conflicting systemd drop-in on an upgrade. The Python
+        # payload finishes; the outer Bash gate must still restore old files.
+        root=Path(self.temp.name)/'shell-rate-limit';root.mkdir()
+        source=(HERE/'portbw-install.sh').read_text()
+        body=source[source.index('install_files() ('):source.index('\ninstall_files  #')]
+        for prefix in ('/usr/local','/etc/portbw','/etc/systemd/system','/run/portbw','/var/tmp'):
+            body=body.replace(prefix,str(root)+prefix)
+        fake=root/'mockpython'
+        fake.write_text('#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\n'
+                        f'root=Path({str(root)!r})\n'
+                        'if "install" in sys.argv:\n'
+                        ' (root/"etc/portbw/config.json").write_text("changed config")\n'
+                        ' (root/"etc/systemd/system/portbw-watch.service").write_text("changed unit")\n')
+        fake.chmod(0o755);body=body.replace('/usr/bin/python3',str(fake))
+        tracked=['usr/local/lib/portbw/portbw.py','usr/local/sbin/portbw','etc/portbw/config.json',
+                 'etc/systemd/system/portbw-watch.timer','etc/systemd/system/portbw-watch.service',
+                 'etc/systemd/system/portbw-restore.service']
+        for f in tracked:
+            path=root/f;path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text('original '+f)
+        (root/'var/tmp').mkdir(parents=True)
+        src=root/'src';src.mkdir();(src/'portbw.py').write_text('new source')
+        header=f'''set -Eeuo pipefail
+SRC='{src}'
+IFACE=eth0
+NFT_ONLY=0
+log() {{ :; }}
+die() {{ echo "$*" >&2; exit 1; }}
+systemctl() {{
+  case "$1" in
+    is-active) [[ "$*" == *portbw-watch.timer* ]] ;;
+    is-enabled) return 0 ;;
+    show) echo 'StartLimitIntervalUSec=10s' ;;
+    *) return 0 ;;
+  esac
+}}
+'''
+        script=root/'test.sh';script.write_text(header+body+'\ninstall_files\n')
+        result=subprocess.run(['bash',str(script)],text=True,capture_output=True)
+        self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertIn('有效 StartLimitIntervalSec 非 0',result.stderr)
+        for f in tracked:self.assertEqual((root/f).read_text(),'original '+f)
+        self.assertFalse(list((root/'var/tmp').iterdir()))
+
+    def test_shell_installer_requires_effective_limit_zero(self):
+        installer=(HERE/'portbw-install.sh').read_text()
+        self.assertIn('StartLimitIntervalUSec=0',installer)
+        self.assertIn('portbw-watch.service 的有效',installer)
+        self.assertIn('systemctl is-active --quiet portbw-watch.timer',installer)
+        self.assertIn('rollback_on_exit()',installer)
+
+
 # Integration regressions for the merged /run sampling cache.  These are
 # intentionally after the upstream unittest.main guard: run with unittest
 # discovery (python3 -m unittest -v test_portbw) to include them.
@@ -862,6 +977,10 @@ class SecondResolutionTests(Base):
         self.assertNotIn('OnUnitInactiveSec=30s',timer)
         self.assertIn('ExecStart=/usr/local/sbin/portbw watch',units['portbw-watch.service'])
         self.assertNotIn('tc qdisc replace',timer)
+        # Debian 12 defaults to 5 starts per 10s: causes start-limit-hit
+        # when a oneshot worker runs each ~1s. Must be disabled per unit.
+        self.assertIn('StartLimitIntervalSec=0',units['portbw-watch.service'])
+        self.assertNotIn('StartLimitIntervalSec=0',units['portbw-restore.service'])
 
 class FastWatchIntegrationTests(Base):
     setup_kernel=WatchIntegrationTests.setup_kernel

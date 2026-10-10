@@ -1260,6 +1260,9 @@ WantedBy=multi-user.target
     'portbw-watch.service':f'''[Unit]
 Description=Check and repair independent port bandwidth rules
 After=local-fs.target
+# At 1-second cadence, systemd's default 5 starts / 10 seconds causes
+# start-limit-hit (confirmed on Debian 12).  This applies ONLY to portbw.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -1325,6 +1328,15 @@ def install(args):
             for name,body in units().items():
                 write_atomic(unit_paths[name],body.encode(),0o644)
             run(['systemctl','daemon-reload'])
+            # Check the EFFECTIVE property, not just the text: a drop-in override
+            # or unrecognized directive must not silently break 1s sampling.
+            limit=run(['systemctl','show','portbw-watch.service',
+                       '-p','StartLimitIntervalUSec'])
+            if limit is None or limit.strip()!='StartLimitIntervalUSec=0':
+                raise Error('portbw-watch.service 启动频率限制未关闭；'
+                            f'实际={limit!r}；请检查 systemd drop-in 覆盖配置')
+            # Clear a prior v5.1 start-limit-hit before re-enabling the timer.
+            run(['systemctl','reset-failed','portbw-watch.service'])
             run(['systemctl','enable','portbw-restore.service','portbw-watch.timer'])
             if enabled:tc_prepare(iface)
             for port,rec in records().items():

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# portbw v5.1 second-resolution TEST candidate; support local pair or remote bootstrap from linshi/main.
+# portbw v5.2 second-resolution TEST candidate; support local pair or remote bootstrap from linshi/main.
 # Always check the exact embedded SHA256 before installing Python payload.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
@@ -16,6 +16,7 @@ usage() {
 
 Debian/Ubuntu + systemd + root：自动补齐依赖、核对源码哈希、识别默认路由网卡，
 并安装 nft + tc 双层限速、开机恢复服务和每1秒自检 timer（best effort）。
+自动检测服务内置 systemd 启动频率限流修复，不需要手工添加 drop-in。
 已有配置和端口规则保留。--nft-only 必须手动指定，不会静默降级。
 HELP
 }
@@ -92,7 +93,7 @@ done
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='1f697acfbb22822a5c86216b96b4f006c31bdd2e60baea2177c9da3503533179'
+EXPECTED_PORTBW_SHA256='2e4616475a0d8bf5ad278a13cbac206b59c19e91d71b38bc1922aeaed1a7b9c3'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'
@@ -249,6 +250,9 @@ WRAPPER_EOF
   "$WRAPPER" audit || die '安装后审计未通过，未认定安装成功'
   systemctl is-enabled --quiet portbw-watch.timer || die '自动检查 timer 未启用'
   systemctl is-active --quiet portbw-watch.timer || die '自动检查 timer 未启动'
+  # Defense in depth: verify the effective setting after the nested installer.
+  [[ "$(systemctl show portbw-watch.service -p StartLimitIntervalUSec)" == 'StartLimitIntervalUSec=0' ]] || \
+    die 'portbw-watch.service 的有效 StartLimitIntervalSec 非 0；拒绝报告安装成功'
   SUCCESS=1
 )
 

@@ -55,6 +55,10 @@ test_systemd_delay_does_not_lose_hold_deadline (test_portbw.StateMachineTests.te
 test_threshold_exact_and_jitter_no_forgiveness (test_portbw.StateMachineTests.test_threshold_exact_and_jitter_no_forgiveness) ... ok
 test_trigger_again_after_recovery (test_portbw.StateMachineTests.test_trigger_again_after_recovery) ... ok
 test_up_down_and_simultaneous_are_independent (test_portbw.StateMachineTests.test_up_down_and_simultaneous_are_independent) ... ok
+test_effective_default_or_bad_dropin_refused_with_unit_rollback (test_portbw.SystemdStartLimitRegressionTests.test_effective_default_or_bad_dropin_refused_with_unit_rollback) ... ok
+test_new_install_confirms_effective_disabled_limit_and_resets_old_failures (test_portbw.SystemdStartLimitRegressionTests.test_new_install_confirms_effective_disabled_limit_and_resets_old_failures) ... ok
+test_shell_installer_requires_effective_limit_zero (test_portbw.SystemdStartLimitRegressionTests.test_shell_installer_requires_effective_limit_zero) ... ok
+test_shell_installer_rolls_back_if_limit_not_zero (test_portbw.SystemdStartLimitRegressionTests.test_shell_installer_rolls_back_if_limit_not_zero) ... ok
 test_cache_loss_does_not_end_persisted_hold (test_portbw.VolatileCacheTests.test_cache_loss_does_not_end_persisted_hold) ... ok
 test_cache_loss_resets_streak_without_false_trigger (test_portbw.VolatileCacheTests.test_cache_loss_resets_streak_without_false_trigger) ... ok
 test_cache_never_overrides_new_manual_rate_intent (test_portbw.VolatileCacheTests.test_cache_never_overrides_new_manual_rate_intent) ... ok
@@ -67,6 +71,8 @@ test_partial_kernel_failure_retries_pending_next_watch (test_portbw.WatchIntegra
 test_rule_snapshot_failure_resets_progress_persists_hold (test_portbw.WatchIntegrationTests.test_rule_snapshot_failure_resets_progress_persists_hold) ... ok
 
 ----------------------------------------------------------------------
-Ran 67 tests in 4.697s
+Ran 71 tests in 9.168s
 
 OK
+
+SYSTEMD UNIT SYNTAX CHECK: exit 0
