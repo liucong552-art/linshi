@@ -800,12 +800,21 @@ def commit(port,up,down,config,deleting=False,auto=None):
 
 # Durable config, active target and phase/deadline live in the port record.
 # Sampler observations are cached under /run/portbw/auto to avoid disk churn.
+# During hold the deadline rolls forward only under sustained saturation / drops.
+# Checkpoints to durable storage are batched, with a final checkpoint at idle.
 # Older static records need no migration; corrupt state is not guessed.
 AUTO_VERSION=1
 # Do not trust sub-half-second measurements or long averaged windows.
 MIN_SAMPLE=0.5
 MAX_SAMPLE_GAP=75.0
 FAST_MAX_SAMPLE_GAP=8.0
+# TCP adapts to tc police; the old 60% base-rate threshold is unreachable
+# after a 100 -> 20 Mbps transition. Use saturation and drop pressure instead.
+ROLLING_NEAR_LIMIT_BP=8500  # 85% of the *limited* rate, conservative lower bound
+ROLLING_DROP_FLOOR_BP=2000  # 20% of limited rate for meaningful drop pressure
+ROLLING_DROP_PPS=3          # sustained overlimits/drops per second
+ROLLING_CONFIRM_SECONDS=2.0
+
 
 
 def max_sample_gap(options):
@@ -858,7 +867,8 @@ def auto_options(args):
 
 def empty_direction():
     return {'phase':'monitor','until':None,'high_since':None,'progress':0.0,
-            'last':None,'mbps':None,'lower_mbps':None,'reason':'等待两个有效采样'}
+            'last':None,'mbps':None,'lower_mbps':None,'reason':'等待两个有效采样',
+            'busy_since':None,'last_busy_at':None}
 
 
 def reset_auto_boot(rec,identity):
@@ -904,6 +914,10 @@ def validate_record(port,rec):
             if key not in s or (s[key] is not None and not finite_number(s[key])):bad()
         if s['progress'] is None or not isinstance(s.get('reason'),str) or 'last' not in s:bad()
         if s['progress']>a['after'] or (s['phase']!='monitor' and s['high_since'] is not None):bad()
+        # Optional fields preserve existing 5.2.1 per-port records during an upgrade.
+        for k in ('busy_since','last_busy_at'):
+            if k in s and s[k] is not None and not finite_number(s[k]):bad()
+        if s['phase']!='hold' and (s.get('busy_since') is not None or s.get('last_busy_at') is not None):bad()
         if s['phase'] in ('hold','cooldown') and s['until'] is None:bad()
         if s['phase'] not in ('hold','cooldown') and s['until'] is not None:bad()
         if s['phase'] in ('entering','restoring') and not rec.get('pending'):bad()
@@ -915,6 +929,9 @@ def validate_record(port,rec):
             if any(not finite_number(last.get(k)) for k in ('start','end','birth_lo','birth_hi')):bad()
             if last['end']<last['start'] or last['birth_hi']<last['birth_lo']:bad()
             if type(last.get('bytes')) is not int or not 0<=last['bytes']<2**64:bad()
+            # Legacy v5.2.1 snapshots had only the byte counter; rebase safely.
+            for k in ('drops','overlimits'):
+                if k in last and (type(last[k]) is not int or not 0<=last[k]<2**64):bad()
             if (not isinstance(last.get('generation'),list)
                 or any(type(h) is not int or h<0 for h in last['generation'])):bad()
         if s['high_since'] is not None and (last is None or s['high_since']>last['end']):bad()
@@ -976,7 +993,18 @@ def volatile_load(port,rec):
 
 
 def break_continuity(s,reason):
-    s.update(last=None,high_since=None,progress=0.0,mbps=None,lower_mbps=None,reason=reason)
+    s.update(last=None,high_since=None,progress=0.0,mbps=None,lower_mbps=None,
+             busy_since=None,reason=reason)
+
+
+def finalize_hold_activity(s,hold):
+    # When pressure ends, pin recovery to the most recent *confirmed* busy
+    # sample. No per-second fsync: one durable deadline update at this edge.
+    last_busy=s.get('last_busy_at')
+    if last_busy is not None:
+        s['until']=max(s['until'],last_busy+hold)
+    s['last_busy_at']=None
+    s['busy_since']=None
 
 
 def police_blocks(output):
@@ -1002,29 +1030,33 @@ def traffic_snapshot():
 def traffic_sample(port,d,rec,snapshot,nft_items):
     if snapshot is None:raise Error('tc 统计快照不可用')
     block=snapshot['blocks'].get(tc_police_index(port,d),'')
-    sent=re.findall(r'\bSent\s+([0-9]+)\s+bytes\s+[0-9]+\s+pkt',block)
+    sent=re.findall(r'\bSent\s+([0-9]+)\s+bytes\s+([0-9]+)\s+pkt\s+' 
+                    r'\(dropped\s+([0-9]+),\s+overlimits\s+([0-9]+)',block)
     installed=re.findall(r'\binstalled\s+([0-9]+)\s+sec\b',block)
     counts=re.search(r'\bref\s+([0-9]+)\s+bind\s+([0-9]+)\b',block)
     if (len(sent)!=1 or len(installed)!=1 or not counts or int(counts[2])!=4
         or int(counts[1]) not in (4,5) or not re.search(r'^\s*skip_hw\s*$',block,re.M)):
         raise Error('tc 字节/创建时间/共享绑定统计缺失或不兼容')
-    count=int(sent[0]);age=int(installed[0]);start=snapshot['start'];end=snapshot['end']
-    if count>=2**64 or age>end+2:raise Error('tc 计数/创建时间异常')
+    count,packets,drops,overlimits=map(int,sent[0]);age=int(installed[0]);start=snapshot['start'];end=snapshot['end']
+    if (max(count,packets,drops,overlimits)>=2**64 or drops>packets
+        or overlimits>packets or age>end+2):
+        raise Error('tc 计数/创建时间异常')
     # Quantized installed age defines an interval, not a fabricated exact birth.
     # Intersect it over successive samples to detect action recreation even if
     # the new counter has already overtaken the previous counter.
     handles=sorted(r['rule']['handle'] for r in nft_items if 'rule' in r
                    and r['rule'].get('comment','').startswith(f'pbw-{port}-{d}-'))
-    return {'bytes':count,'start':start,'end':end,
+    return {'bytes':count,'drops':drops,'overlimits':overlimits,
+            'start':start,'end':end,
             'birth_lo':max(0.0,start-age-1.1),'birth_hi':end-age+0.1,
             'generation':handles}
 
 
-def observe(s,sample,base,options):
+def observe(s,sample,base,options,limited=None):
     previous=s['last'];s['last']=sample
     s['mbps']=s['lower_mbps']=None
     if previous is None:
-        s['reason']='建立统计基线';return
+        s['reason']='建立统计基线';return False
     low=sample['start']-previous['end'];high=sample['end']-previous['start']
     birth_lo=max(sample['birth_lo'],previous['birth_lo'])
     birth_hi=min(sample['birth_hi'],previous['birth_hi'])
@@ -1033,25 +1065,60 @@ def observe(s,sample,base,options):
     if not MIN_SAMPLE<=low or high>max_gap:reason='采样间隔异常/延迟，重新累计'
     elif sample['generation']!=previous['generation'] or birth_lo>birth_hi:reason='内核规则重建，重新累计'
     elif sample['bytes']<previous['bytes']:reason='计数器清零/回绕，重新累计'
+    elif s['phase']=='hold' and (limited is None or
+          any(k not in sample or k not in previous for k in ('drops','overlimits'))):
+        reason='缺少可靠丢包计数，重新建立滚动保护采样基线'
+    elif s['phase']=='hold' and (sample['drops']<previous['drops'] or
+                                 sample['overlimits']<previous['overlimits']):
+        reason='丢包计数器清零/回绕，重新建立基线'
     if reason:
-        break_continuity(s,reason);s['last']=sample;return
+        break_continuity(s,reason);s['last']=sample;return False
     sample.update(birth_lo=birth_lo,birth_hi=birth_hi)
     delta=sample['bytes']-previous['bytes']
     midpoint=(low+high)/2
     s['mbps']=delta*8/midpoint/1000000
     s['lower_mbps']=delta*8/high/1000000
+    if s['phase']=='hold':
+        # tc's 'Sent' counts attempted/action-seen bytes (possibly dropped),
+        # NOT acknowledged client throughput. Here it is pressure evidence.
+        # Require either near-capacity attempted traffic, or repeated drops
+        # accompanied by meaningful traffic. An isolated drop is insufficient.
+        near=Decimal(delta)*10000 >= Decimal(str(high))*limited*ROLLING_NEAR_LIMIT_BP
+        drop_delta=max(sample['drops']-previous['drops'],
+                       sample['overlimits']-previous['overlimits'])
+        congested=(Decimal(delta)*10000 >= Decimal(str(high))*limited*ROLLING_DROP_FLOOR_BP
+                   and Decimal(drop_delta)>=Decimal(str(high))*ROLLING_DROP_PPS)
+        if near or congested:
+            if s.get('busy_since') is None:s['busy_since']=previous['end']
+            confirmed=sample['start']-s['busy_since']>=min(ROLLING_CONFIRM_SECONDS,
+                                                            options['hold'])
+            if confirmed:
+                s['last_busy_at']=sample['start']
+                # Checkpoint at most once per ~half hold while constantly busy.
+                # On falling edge finalize_hold_activity pins the exact deadline.
+                if s['until']-sample['start']<=options['hold']/2:
+                    s['until']=max(s['until'],sample['start']+options['hold'])
+                s['reason']='滚动保护续期：'+('持续接近降速上限' if near else '持续超限丢包')
+            else:
+                s['reason']='检测到拥塞，等待连续采样确认'
+        else:
+            finalize_hold_activity(s,options['hold'])
+            s['reason']='负载下降，等待滚动保护期结束'
+        s.update(high_since=None,progress=0.0)
+        return True
     if s['phase']!='monitor':
-        s.update(high_since=None,progress=0.0,reason='保护/冷却期间只展示采样');return
+        s.update(high_since=None,progress=0.0,reason='冷却期间只展示采样');return True
     # Use the longest possible interval for threshold testing (conservative).
     above=Decimal(delta)*10000 >= Decimal(str(high))*base*options['trigger_bp']
     if not above:
-        s.update(high_since=None,progress=0.0,reason='低于阈值，连续时间清零');return
+        s.update(high_since=None,progress=0.0,reason='低于阈值，连续时间清零');return True
     if s['high_since'] is None:s['high_since']=previous['end']
     s['progress']=max(0.0,sample['start']-s['high_since'])
     s['reason']='连续窗口达到阈值'
     if s['progress']>=options['after']:
         s.update(phase='entering',until=None,high_since=None,progress=0.0,
-                 last=None,reason='等待降速生效')
+                 last=None,busy_since=None,last_busy_at=None,reason='等待降速生效')
+    return True
 
 
 def advance_auto(rec,now,samples,errors):
@@ -1063,17 +1130,25 @@ def advance_auto(rec,now,samples,errors):
     rt['checked_at']=now
     for d,s in rt['dirs'].items():
         phase=s['phase']
-        if phase=='hold' and now>=s['until']:
-            break_continuity(s,'保护到期，等待基础速度生效')
-            s.update(phase='restoring',until=None);rec[d]=a['base'][d];rec['pending']=True
-            continue
         if phase=='cooldown' and now>=s['until']:
             break_continuity(s,'冷却结束，重新建立采样基线')
             s.update(phase='monitor',until=None)
         if s['phase'] in ('entering','restoring'):continue
         if samples.get(d) is None:
-            break_continuity(s,errors.get(d,'采样失败'));continue
-        observe(s,samples[d],a['base'][d],a)
+            if phase=='hold':finalize_hold_activity(s,a['hold'])
+            break_continuity(s,errors.get(d,'采样失败'))
+        else:
+            valid=observe(s,samples[d],a['base'][d],a,
+                          a['limited'][d] if phase=='hold' else None)
+            if phase=='hold' and not valid:finalize_hold_activity(s,a['hold'])
+        # Expiration MUST be evaluated after this tick's pressure evidence:
+        # rolling protection cannot be released on a sustained busy tick.
+        if s['phase']=='hold' and now>=s['until']:
+            finalize_hold_activity(s,a['hold'])
+            if now>=s['until']:
+                break_continuity(s,'滚动保护到期，等待基础速度生效')
+                s.update(phase='restoring',until=None,last_busy_at=None)
+                rec[d]=a['base'][d];rec['pending']=True
         if s['phase']=='entering':rec[d]=a['limited'][d];rec['pending']=True
 
 
@@ -1094,11 +1169,13 @@ def finish_apply(port,rec,config,*,watch_rows=None,damaged_siblings=False):
         now=boottime();a=rec['auto']
         for d,s in rec['runtime']['dirs'].items():
             if s['phase']=='entering':
-                s.update(phase='hold',until=now+a['hold'],reason='降速已通过审计，保护计时开始')
-                print(f'{port} {d}: 自动降速 {rate_mbps(rec[d])} Mbps，保护 {a["hold"]} 秒')
+                s.update(phase='hold',until=now+a['hold'],busy_since=None,last_busy_at=None,
+                         reason='降速已通过审计，滚动保护开始')
+                print(f'{port} {d}: 自动降速 {rate_mbps(rec[d])} Mbps，滚动保护 {a["hold"]} 秒')
             elif s['phase']=='restoring':
                 s.update(phase='cooldown' if a['cooldown'] else 'monitor',
                          until=now+a['cooldown'] if a['cooldown'] else None,
+                         busy_since=None,last_busy_at=None,
                          reason='基础速度已恢复')
                 print(f'{port} {d}: 恢复基础速度 {rate_mbps(rec[d])} Mbps')
     rec['pending']=False
@@ -1190,7 +1267,7 @@ def auto_operate(args,config):
         current=read_json(port_file(port),default={'port':port,'up':0,'down':0})
         validate_record(port,current)
         commit(port,options['base']['up'],options['base']['down'],config,auto=options)
-        print(f'{port}: 自动模式已保存，上下行独立监测；after={options["after"]}s / hold={options["hold"]}s')
+        print(f'{port}: 自动模式已保存，上下行独立监测；after={options["after"]}s / 滚动hold={options["hold"]}s')
         return
     rec=read_json(port_file(port));validate_record(port,rec)
     if args.auto_action=='status' and 'auto' in rec:volatile_load(port,rec)
@@ -1209,7 +1286,7 @@ def auto_operate(args,config):
     same_boot=rt['boot_id']==boot_id()
     print(f'端口 {port}: 内核审计={state} pending={rec.get("pending",False)}；'
           '当前速度为目标配置，审计 OK 才表示内核已匹配')
-    print(f'阈值={a["trigger_bp"]/100:g}% 连续={a["after"]}s 保护={a["hold"]}s 冷却={a["cooldown"]}s')
+    print(f'阈值={a["trigger_bp"]/100:g}% 连续={a["after"]}s 滚动保护={a["hold"]}s 冷却={a["cooldown"]}s')
     for d,s in rt['dirs'].items():
         age=max(0,now-s['last']['end']) if same_boot and s['last'] else None
         fresh=age is not None and age<=max_sample_gap(a) and state=='OK'
@@ -1335,8 +1412,12 @@ def install(args):
             if limit is None or limit.strip()!='StartLimitIntervalUSec=0':
                 raise Error('portbw-watch.service 启动频率限制未关闭；'
                             f'实际={limit!r}；请检查 systemd drop-in 覆盖配置')
-            # Clear a prior v5.1 start-limit-hit before re-enabling the timer.
-            run(['systemctl','reset-failed','portbw-watch.service'])
+            # Fresh installs can have a never-started service that is not loaded.
+            # Do not call reset-failed unless systemd reports an actual failure.
+            # run(..., check=False) returns None for a nonzero exit status, but
+            # returns '' when is-failed --quiet reports success (exit status 0).
+            if run(['systemctl','is-failed','--quiet','portbw-watch.service'], check=False) is not None:
+                run(['systemctl','reset-failed','portbw-watch.service'])
             run(['systemctl','enable','portbw-restore.service','portbw-watch.timer'])
             if enabled:tc_prepare(iface)
             for port,rec in records().items():

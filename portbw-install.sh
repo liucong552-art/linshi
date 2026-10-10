@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# portbw v5.2 second-resolution TEST candidate; support local pair or remote bootstrap from linshi/main.
+# portbw v5.2.2 rolling hold VPS-first TEST candidate; support local pair or remote bootstrap from linshi/main.
 # Always check the exact embedded SHA256 before installing Python payload.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
@@ -93,7 +93,7 @@ done
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='2e4616475a0d8bf5ad278a13cbac206b59c19e91d71b38bc1922aeaed1a7b9c3'
+EXPECTED_PORTBW_SHA256='225013ce3933c6a56c26110b22ae70749154445695532348e6715f858f58d327'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'

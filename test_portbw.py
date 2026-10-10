@@ -39,8 +39,10 @@ def record(port=40001,**kw):
     return r
 
 
-def sample(t,b,gen=1,birth=0,width=0):
-    return {'bytes':int(b),'start':float(t),'end':float(t+width),'birth_lo':float(birth),
+def sample(t,b,gen=1,birth=0,width=0,drops=0,overlimits=None):
+    return {'bytes':int(b),'drops':int(drops),
+            'overlimits':int(drops if overlimits is None else overlimits),
+            'start':float(t),'end':float(t+width),'birth_lo':float(birth),
             'birth_hi':float(birth+1),'generation':[gen]}
 
 
@@ -566,7 +568,7 @@ systemctl() {{
 class SystemdStartLimitRegressionTests(Base):
     """Regression for real Debian 12 v5.1 start-limit-hit at 1s cadence."""
 
-    def _install_with_systemd(self, effective):
+    def _install_with_systemd(self, effective, *, failed=False):
         original_exists=Path.exists
         def exists(path):
             return True if str(path)=='/run/systemd/system' else original_exists(path)
@@ -575,6 +577,10 @@ class SystemdStartLimitRegressionTests(Base):
             calls.append(cmd)
             if cmd[:2]==['systemctl','show']:
                 return effective
+            if cmd[:3]==['systemctl','is-failed','--quiet']:
+                return '' if failed else None
+            if cmd[:2]==['systemctl','reset-failed'] and not failed:
+                raise p.Error('Unit portbw-watch.service not loaded')
             if cmd[:2]==['systemctl','is-enabled']:
                 return 'disabled\n'
             if cmd[:2]==['systemctl','is-active']:
@@ -586,17 +592,44 @@ class SystemdStartLimitRegressionTests(Base):
             p.install(argparse.Namespace(iface='eth0',nft_only=False))
         return calls
 
-    def test_new_install_confirms_effective_disabled_limit_and_resets_old_failures(self):
+    def test_fresh_install_skips_reset_failed_for_not_loaded_service(self):
         calls=self._install_with_systemd('StartLimitIntervalUSec=0\n')
         self.assertIn(['systemctl','show','portbw-watch.service',
                        '-p','StartLimitIntervalUSec'],calls)
-        self.assertIn(['systemctl','reset-failed','portbw-watch.service'],calls)
-        self.assertLess(calls.index(['systemctl','reset-failed','portbw-watch.service']),
-                        calls.index(['systemctl','start','portbw-watch.timer']))
+        self.assertIn(['systemctl','is-failed','--quiet','portbw-watch.service'],calls)
+        self.assertNotIn(['systemctl','reset-failed','portbw-watch.service'],calls)
+        self.assertIn(['systemctl','start','portbw-watch.timer'],calls)
         self.assertIn('StartLimitIntervalSec=0',
                       (p.UNITS/'portbw-watch.service').read_text())
         self.assertIn('OnUnitInactiveSec=1s',
                       (p.UNITS/'portbw-watch.timer').read_text())
+
+    def test_upgrade_resets_actual_failed_worker(self):
+        calls=self._install_with_systemd('StartLimitIntervalUSec=0\n',failed=True)
+        self.assertIn(['systemctl','reset-failed','portbw-watch.service'],calls)
+        self.assertLess(calls.index(['systemctl','reset-failed','portbw-watch.service']),
+                        calls.index(['systemctl','start','portbw-watch.timer']))
+
+    def test_reset_failed_error_when_failed_is_not_silently_ignored(self):
+        original_exists=Path.exists
+        def exists(path):
+            return True if str(path)=='/run/systemd/system' else original_exists(path)
+        before=p.cfg();calls=[]
+        def fake_run(cmd,**kwargs):
+            calls.append(cmd)
+            if cmd[:2]==['systemctl','show']:return 'StartLimitIntervalUSec=0\n'
+            if cmd[:3]==['systemctl','is-failed','--quiet']:return ''
+            if cmd[:2]==['systemctl','reset-failed']:raise p.Error('reset failed')
+            if cmd[:2]==['systemctl','is-enabled']:return 'disabled\n'
+            if cmd[:2]==['systemctl','is-active']:return 'inactive\n'
+            return ''
+        with patch.object(Path,'exists',exists),patch.object(p.shutil,'which',return_value='/mock'),\
+             patch.object(p,'run',side_effect=fake_run),patch.object(p,'tc_qdiscs',return_value=[]),\
+             patch.object(p,'ensure_base',return_value=[]),patch.object(p,'tc_prepare'),\
+             self.assertRaisesRegex(p.Error,'reset failed'):
+            p.install(argparse.Namespace(iface='eth0',nft_only=False))
+        self.assertEqual(p.cfg(),before)
+        self.assertNotIn(['systemctl','start','portbw-watch.timer'],calls)
 
     def test_effective_default_or_bad_dropin_refused_with_unit_rollback(self):
         original_exists=Path.exists
@@ -1006,3 +1039,164 @@ class FastWatchIntegrationTests(Base):
         self.assertEqual(p.max_sample_gap(options(after='30s')),45.0)
         self.assertEqual(p.max_sample_gap(options(after='60s')),75.0)
         self.assertEqual(p.max_sample_gap(options(after='90s')),75.0)
+
+
+class RollingProtectionTests(Base):
+    """v5.2.2: saturation OR sustained drops refresh hold, not a fixed timer."""
+    def rtick(self,r,t,amount,drop=0,down_amount=0):
+        self.now=float(t)
+        p.advance_auto(r,float(t),{'up':sample(t,amount,drops=drop),
+                                   'down':sample(t,down_amount)},{})
+        if r.get('pending'):
+            with patch.object(p,'apply'):p.finish_apply(r['port'],r,self.config)
+        p.validate_record(r['port'],r)
+
+    def start(self,hold='2m'):
+        r=record(after='1s',hold=hold,cooldown='60s')
+        self.rtick(r,100,0)
+        self.rtick(r,101,1250000)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'hold')
+        self.rtick(r,102,1250000) # action snapshot baseline after rate replacement
+        return r
+
+    def test_saturated_download_keeps_hold_beyond_120_seconds(self):
+        r=self.start();b=1250000
+        for t in range(103,371):
+            b+=580000  # 4.64 Mbps ~=93% of the 5 Mbps limited upstream
+            self.rtick(r,t,b)
+        self.assertEqual(r['up'],625000)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'hold')
+        self.assertGreater(r['runtime']['dirs']['up']['until'],371)
+        self.assertIn('滚动保护',r['runtime']['dirs']['up']['reason'])
+        self.rtick(r,371,b) # pressure stopped; persist last pressure +120s
+        self.assertEqual(r['runtime']['dirs']['up']['until'],490)
+        self.rtick(r,489,b)
+        self.assertEqual(r['up'],625000)
+        self.rtick(r,490,b)
+        self.assertEqual(r['up'],1250000)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'cooldown')
+
+    def test_sustained_overlimits_renews_below_saturation_threshold(self):
+        r=self.start();b=1250000;drops=0
+        for t in range(103,253):
+            b+=250000  # 2 Mbps attempted (<85% of 5 Mbps)
+            drops+=10    # sustained 10 packet drops per second
+            self.rtick(r,t,b,drops)
+        self.assertEqual(r['up'],625000)
+        self.assertIn('超限丢包',r['runtime']['dirs']['up']['reason'])
+        self.rtick(r,253,b,drops)
+        self.assertEqual(r['runtime']['dirs']['up']['until'],372)
+        self.rtick(r,372,b,drops)
+        self.assertEqual(r['up'],1250000)
+
+    def test_one_off_burst_does_not_renew_hold(self):
+        r=self.start();b=1250000
+        self.rtick(r,103,b+650000)
+        b+=650000
+        for t in range(104,222):self.rtick(r,t,b)
+        self.assertEqual(r['up'],1250000)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'cooldown')
+
+    def test_sparse_drops_and_low_load_do_not_renew(self):
+        r=self.start();b=1250000;drops=0
+        for t in range(103,222):
+            b+=10000;drops+=2
+            self.rtick(r,t,b,drops)
+        self.assertEqual(r['up'],1250000)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'cooldown')
+
+    def test_bytes_counter_reset_cannot_fake_pressure(self):
+        r=self.start();b=1250000
+        for t in range(103,115):
+            b+=580000;self.rtick(r,t,b)
+        deadline=r['runtime']['dirs']['up']['until']
+        self.rtick(r,115,1) # kernel counter reset => discard continuity
+        s=r['runtime']['dirs']['up']
+        self.assertIsNone(s['mbps'])
+        self.assertGreaterEqual(s['until'],deadline)
+        self.assertIsNone(s.get('last_busy_at'))
+
+    def test_drop_counter_reset_breaks_continuity_and_flushes_deadline(self):
+        r=self.start();b=1250000;drops=0
+        for t in range(103,115):
+            b+=250000;drops+=10;self.rtick(r,t,b,drops)
+        self.rtick(r,115,b+250000,1) # dropped counter rolled back
+        st=r['runtime']['dirs']['up']
+        self.assertIsNone(st['mbps'])
+        self.assertEqual(st['until'],234)  # last confirmed busy at 114
+        self.assertIsNone(st.get('last_busy_at'))
+
+    def test_missing_statistics_does_not_extend_hold_indefinitely(self):
+        r=self.start();b=1250000
+        for t in range(103,115):
+            b+=580000;self.rtick(r,t,b)
+        self.now=115
+        p.advance_auto(r,115,{}, {'up':'tc gone','down':'tc gone'})
+        self.assertEqual(r['runtime']['dirs']['up']['until'],234)
+        self.now=234
+        p.advance_auto(r,234,{}, {'up':'tc gone','down':'tc gone'})
+        with patch.object(p,'apply'):p.finish_apply(r['port'],r,self.config)
+        self.assertEqual(r['up'],1250000)
+
+    def test_legacy_521_sample_rebases_without_crash(self):
+        r=self.start()
+        s=r['runtime']['dirs']['up']
+        s['last']=sample(110,10000000)
+        s['last'].pop('drops');s['last'].pop('overlimits')
+        s.pop('busy_since');s.pop('last_busy_at')
+        p.validate_record(40001,r)
+        self.rtick(r,111,10600000)
+        self.assertEqual(r['up'],625000)
+        self.assertIsNone(s['mbps'])
+        self.assertIn('丢包计数',s['reason'])
+
+    def test_invalid_drop_stats_rejected_fail_closed(self):
+        r=record();self.now=100
+        block=action_block(40001,'up',r['up'],999)
+        for invalid in [block.replace('dropped 3','dropped -1'),
+                        block.replace('overlimits 3','overlimits -1'),
+                        block.replace('Sent 999 bytes 100 pkt','Sent 999 bytes 2 pkt')]:
+            snap={'start':100,'end':100,'blocks':{p.tc_police_index(40001,'up'):invalid}}
+            with self.assertRaises(p.Error):
+                p.traffic_sample(40001,'up',r,snap,nft_fixture(40001,r))
+
+    def test_near_cap_minimum_two_windows_for_regular_hold(self):
+        r=self.start();b=1250000
+        self.rtick(r,103,b+580000)
+        st=r['runtime']['dirs']['up']
+        self.assertIsNone(st.get('last_busy_at'))
+        self.assertIn('等待连续',st['reason'])
+        self.rtick(r,104,b+580000*2)
+        self.assertEqual(st['last_busy_at'],104)
+
+    def test_unrelated_up_and_down_remain_independent(self):
+        r=self.start();b=1250000
+        for t in range(103,253):
+            b+=580000;self.rtick(r,t,b)
+        self.assertEqual(r['runtime']['dirs']['up']['phase'],'hold')
+        self.assertEqual(r['runtime']['dirs']['down']['phase'],'monitor')
+        self.assertEqual(r['down'],2500000)
+
+class RollingDurableCheckpointTests(Base):
+    setup_kernel=WatchIntegrationTests.setup_kernel
+
+    def test_sustained_roll_does_not_fsync_each_second(self):
+        r=record(after='1s',hold='2m',cooldown='60s')
+        self.setup_kernel({40001:r})
+        def traffic(port,d,rec,ss,nft):
+            if d=='down':return sample(self.now,0)
+            if self.now<=100:return sample(self.now,0)
+            if self.now<=102:return sample(self.now,1250000)
+            return sample(self.now,1250000+int(self.now-102)*580000)
+        with patch.object(p,'traffic_snapshot',return_value={}),\
+             patch.object(p,'traffic_sample',side_effect=traffic),\
+             patch.object(p,'write_json',wraps=p.write_json) as writer:
+            for t in range(100,361):
+                self.now=float(t);p.reconcile(self.config,monitor=True)
+            disk=[x for x in writer.call_args_list if x.args[0]==p.port_file(40001)]
+            memory=[x for x in writer.call_args_list if x.args[0]==p.volatile_path(40001)]
+        self.assertLessEqual(len(disk),10, 'sustained load must not fsync state every second')
+        self.assertGreaterEqual(len(memory),259)
+        self.assertEqual(p.records()[40001]['up'],625000)
+        self.assertEqual(p.records()[40001]['runtime']['dirs']['up']['phase'],'hold')
+        self.assertGreater(p.records()[40001]['runtime']['dirs']['up']['until'],360)
