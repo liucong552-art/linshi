@@ -1,0 +1,329 @@
+--- /mnt/data/ratelimit_review/v4/portbw.py	2026-10-10 06:05:13.956500869 +0000
++++ portbw.py	2026-10-10 06:16:32.667720055 +0000
+@@ -464,11 +464,27 @@
+             busy.add(pref)
+     return busy
+ 
+-def ensure_tc_prefs(port,rec,iface):
+-    """Allocate FOUR globally distinct flower priorities; persist before installing."""
++def ensure_tc_prefs(port,rec,iface,*,watch_rows=None,damaged_siblings=False):
++    """Verify allocated slots; allocate NEW slots only with a complete inventory.
++
++    The watchdog may repair an already allocated, valid port even when a
++    different port record is damaged.  It must not allocate any new prefs in
++    that situation: the damaged record may conceal previously reserved prefs.
++    CLI operations still require the strict complete records() inventory.
++    Every existing pref is independently checked against both live tc directions
++    before making changes, whether the inventory is partial or complete.
++    """
++    if watch_rows is None and damaged_siblings:
++        raise Error('不允许在没有已验证端口清单时使用损坏配置隔离模式')
+     rows={d:tc_filters(iface,d) for d in ('ingress','egress')}
++    existing=rec.get('tc_prefs')
++    if damaged_siblings and existing is None:
++        raise Error(f'{port}: 其他端口配置损坏，拒绝分配新的 tc pref；修复配置后重试')
+     used=set()
+-    for other,r in records().items():
++    inventory=records() if watch_rows is None else watch_rows
++    if watch_rows is not None and (port not in watch_rows or watch_rows[port] is not rec):
++        raise Error(f'{port}: watchdog 已验证记录不一致，拒绝更改 tc')
++    for other,r in inventory.items():
+         if other==port:continue
+         prefs=r.get('tc_prefs')
+         if not isinstance(prefs,dict) or set(prefs)!={tc_slot_key(f,t) for f in FAMILIES for t in TRANSPORTS}:
+@@ -478,7 +494,6 @@
+                 raise Error(f'{other}: tc pref 重复/损坏')
+             used.add(value)
+     slots=[(f,t) for f in FAMILIES for t in TRANSPORTS]
+-    existing=rec.get('tc_prefs')
+     if existing is not None:
+         if not isinstance(existing,dict) or set(existing)!={tc_slot_key(f,t) for f,t in slots}:
+             raise Error(f'{port}: 检测到旧版 tc 状态，请恢复干净快照后再测试')
+@@ -748,12 +763,19 @@
+         return True
+     except Error:return False
+ 
+-def apply(port,rec,config):
++def apply(port,rec,config,*,watch_rows=None,damaged_siblings=False):
++    # Fail BEFORE any nft/tc mutation if a damaged sibling makes slot ownership
++    # unknowable. Existing valid slots are handled by ensure_tc_prefs below.
++    if damaged_siblings and (watch_rows is None or watch_rows.get(port) is not rec):
++        raise Error(f'{port}: 缺少可信的 watchdog 端口快照，拒绝修改限速规则')
++    if damaged_siblings and config.get('tc_enabled') and 'tc_prefs' not in rec:
++        raise Error(f'{port}: 其他端口配置损坏，拒绝分配新的 tc pref；修复配置后重试')
+     if rec['down']>0 and not config.get('tc_enabled'):
+         raise Error('UDP/TCP 下载限速必须使用 tc egress；不可采用 nft-only，以免本地发送程序收到 EPERM')
+     if not nft_ok(port,rec):apply_nft(port,rec)
+     if config.get('tc_enabled'):
+-        ensure_tc_prefs(port,rec,config['iface'])
++        ensure_tc_prefs(port,rec,config['iface'],watch_rows=watch_rows,
++                        damaged_siblings=damaged_siblings)
+         if not tc_ok(port,rec,config['iface']):
+             apply_tc(port,rec,config['iface'])
+             if not tc_ok(port,rec,config['iface']):
+@@ -1044,9 +1066,12 @@
+         if s['phase']=='entering':rec[d]=a['limited'][d];rec['pending']=True
+ 
+ 
+-def finish_apply(port,rec,config):
++def finish_apply(port,rec,config,*,watch_rows=None,damaged_siblings=False):
+     # Caller persists intent BEFORE any kernel mutation. On crash, replay is safe.
+-    apply(port,rec,config)
++    if watch_rows is None and not damaged_siblings:
++        apply(port,rec,config)
++    else:
++        apply(port,rec,config,watch_rows=watch_rows,damaged_siblings=damaged_siblings)
+     if rec.get('deleting'):
+         port_file(port).unlink(missing_ok=True)
+         directory=os.open(port_file(port).parent,os.O_RDONLY|os.O_DIRECTORY)
+@@ -1072,6 +1097,13 @@
+ 
+ def reconcile(config,monitor=False):
+     rows,failures=records_for_watch();identity=boot_id()
++    # Preserve the original discovery result while failures are appended later.
++    damaged_siblings=bool(failures)
++    def finish_repair(port,rec):
++        if damaged_siblings:
++            finish_apply(port,rec,config,watch_rows=rows,damaged_siblings=True)
++        else:
++            finish_apply(port,rec,config)
+     if any('auto' in r for r in rows.values()) and not config.get('tc_enabled'):
+         raise Error('自动模式必须启用 tc；拒绝 nft-only 静默降级')
+     for port,rec in rows.items():
+@@ -1102,7 +1134,7 @@
+                 if not healthy:
+                     for s in rec['runtime']['dirs'].values():break_continuity(s,'规则待修复，连续时间清零')
+                     rec['pending']=True;write_json(port_file(port),rec)
+-                    finish_apply(port,rec,config)
++                    finish_repair(port,rec)
+                     # Do not use a snapshot taken before repair; next watch rebases.
+                     continue
+                 if monitor:
+@@ -1119,7 +1151,8 @@
+                     if rec.get('pending') or volatile_checkpoint(rec)!=durable_before:
+                         # Persist decisions before any kernel change; not raw samples.
+                         write_json(port_file(port),rec)
+-                        if rec.get('pending'):finish_apply(port,rec,config)
++                        if rec.get('pending'):
++                            finish_repair(port,rec)
+                         else:volatile_save(port,rec)
+                     else:
+                         # One atomic tmpfs write per tick; avoids fsyncing flash/disk
+@@ -1127,7 +1160,7 @@
+                         volatile_save(port,rec)
+             elif not healthy or rec.get('deleting'):
+                 rec['pending']=True;write_json(port_file(port),rec)
+-                finish_apply(port,rec,config)
++                finish_repair(port,rec)
+         except Exception as e:
+             # Save continuity failure without inventing a new bandwidth target.
+             if 'auto' in rec:
+--- /mnt/data/ratelimit_review/v4/portbw-install.sh	2026-10-10 06:05:13.957408635 +0000
++++ portbw-install.sh	2026-10-10 06:16:32.669315013 +0000
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+-# portbw Debian/Ubuntu linshi optional TCP+UDP shared bandwidth release: portbw-install.sh + portbw.py
+-# This entry point both bootstraps from GitHub and installs the program and units.
++# portbw v5 local-only real-host trial package; always install with the bundled portbw.py
++# Remote bootstrap is deliberately disabled: the linshi test repo has no published portbw.py.
+ # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
+ set -Eeuo pipefail
+ umask 077
+@@ -11,8 +11,7 @@
+ usage() {
+   cat <<'HELP'
+ 用法：
+-  bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main/portbw-install.sh')
+-  bash portbw-install.sh [install|update] [--iface eth0] [--nft-only]
++  bash ./portbw-install.sh [install|update] [--iface eth0] [--nft-only]
+ 
+ Debian/Ubuntu + systemd + root：自动补齐依赖、核对源码哈希、识别默认路由网卡，
+ 并安装 nft + tc 双层限速、开机恢复服务和每30秒自检 timer。
+@@ -35,6 +34,14 @@
+   esac
+ done
+ 
++# This candidate is not published to any remote repository.  Refuse remote
++# process-substitution bootstrap before attempting package installation.
++SOURCE_SCRIPT="${BASH_SOURCE[0]:-}"
++case "${SOURCE_SCRIPT##*/}" in
++  portbw-install.sh|install.sh) [[ -f "$SOURCE_SCRIPT" ]] || die '仅支持解压包内的本地安装文件' ;;
++  *) die '第5版仅支持解压包本地安装；禁止远程一键脚本（避免拉取到错误源码）' ;;
++esac
++
+ [[ ${EUID:-999} -eq 0 ]] || die '请使用 root 执行'
+ [[ -f /etc/os-release ]] || die '无法识别系统；仅支持 Debian/Ubuntu'
+ # shellcheck source=/etc/os-release
+@@ -61,34 +68,14 @@
+   command -v "$cmd" >/dev/null || die "依赖安装后仍缺少命令：$cmd"
+ done
+ 
+-# Bash process substitution has /dev/fd/N as BASH_SOURCE[0]. If a real local
+-# install.sh exists, use a local copy of portbw.py; otherwise fetch from GitHub.
+-SOURCE_SCRIPT="${BASH_SOURCE[0]}"
+-WORK=''
+-cleanup_source() {
+-  if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf -- "$WORK"; fi
+-}
+-trap cleanup_source EXIT
+-trap 'exit 130' INT
+-trap 'exit 143' TERM
+-trap 'exit 129' HUP
+-if [[ ( "${SOURCE_SCRIPT##*/}" == portbw-install.sh || "${SOURCE_SCRIPT##*/}" == install.sh ) && -f "$SOURCE_SCRIPT" ]]; then
+-  SRC="$(cd -- "$(dirname -- "$SOURCE_SCRIPT")" && pwd -P)"
+-  [[ -f "$SRC/portbw.py" ]] || die '本地缺少 portbw.py；请与 portbw-install.sh 放在同一目录'
+-  log "使用本地源码：$SRC"
+-else
+-  WORK="$(mktemp -d /var/tmp/portbw-src.XXXXXXXX)"
+-  SRC="$WORK"
+-  BASE='https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main'
+-  log '从 GitHub main 下载限速主体 portbw.py ...'
+-  curl -fL --retry 3 --connect-timeout 15 --max-time 120 \
+-    --proto '=https' --tlsv1.2 --silent --show-error \
+-    "$BASE/portbw.py" -o "$SRC/portbw.py" || die 'GitHub 主体文件下载失败；检查 main 根目录是否有 portbw.py'
+-fi
++# The local file and program hash must always match this review package.
++SRC="$(cd -- "$(dirname -- "$SOURCE_SCRIPT")" && pwd -P)"
++[[ -f "$SRC/portbw.py" ]] || die '本地缺少 portbw.py；必须与 portbw-install.sh 放在同一目录'
++log "使用本地源码：$SRC"
+ 
+ # Embedded manifest: only TWO executable files need to exist online.
+ # The sha256 of portbw.py must change together with this value in the installer.
+-EXPECTED_PORTBW_SHA256='f3c5f87e06936fc4ff2510586cce1e6fc8f510926409e751cdfdf4dcf77c8678'
++EXPECTED_PORTBW_SHA256='57d99b8488651b00fb63aa8853ee93f27990f9bfea5ca7e36dfc97acd8e7019f'
+ ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
+ [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
+ python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'
+--- /mnt/data/ratelimit_review/v4/test_portbw.py	2026-10-10 06:05:13.958083238 +0000
++++ test_portbw.py	2026-10-10 06:16:51.568956137 +0000
+@@ -553,7 +553,8 @@
+         expected=re.search(r"EXPECTED_PORTBW_SHA256='([0-9a-f]{64})'",source)[1]
+         self.assertEqual(expected,hashlib.sha256((HERE/'portbw.py').read_bytes()).hexdigest())
+         self.assertNotIn('zuizhongheji',source)
+-        self.assertIn('https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main',source)
++        self.assertIn('第5版仅支持解压包本地安装',source)
++        self.assertNotIn('raw.githubusercontent.com/',source)
+         self.assertIn('"$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256"',source)
+         subprocess.run(['bash','-n',str(HERE/'portbw-install.sh')],check=True)
+ 
+@@ -651,4 +652,120 @@
+         self.assertFalse(p.volatile_load(40001,loaded))
+         self.assertEqual(loaded['up'],2500000)
+ 
++
++class DamagedSiblingRegressionTests(Base):
++    """Regression: corrupt config must not block known-owned tc transitions.
++
++    No kernel commands are executed; state changes are simulated while the
++    actual record/pref safety checks and watchdog state machine execute.
++    """
++
++    def test_corrupt_sibling_allows_existing_port_to_actually_throttle(self):
++        r=record();p.write_json(p.port_file(40001),r)
++        bad=p.port_file(40002);bad.write_text('"corrupted"')
++        limits={'nft':dict(up=r['up'],down=r['down']),
++                'tc':dict(up=r['up'],down=r['down'])}
++        slots=tc_fixture(40001,r)['rows']
++        def healthy(kind,rec):return all(limits[kind][d]==rec[d] for d in p.CHAIN)
++        def sample_load(port,d,rec,snapshot,items):
++            return sample(self.now,(self.now-100)*(1250000 if d=='up' else 0))
++        def mark_applied(kind,port,rec,*args):
++            limits[kind].update({d:rec[d] for d in p.CHAIN})
++        with patch.object(p,'ensure_base',return_value=[]),\
++             patch.object(p,'tc_snapshot',return_value={}),\
++             patch.object(p,'traffic_snapshot',return_value={}),\
++             patch.object(p,'traffic_sample',side_effect=sample_load),\
++             patch.object(p,'tc_filters',side_effect=lambda iface,td:slots[td]),\
++             patch.object(p,'nft_ok',side_effect=lambda port,rec,*arg:healthy('nft',rec)),\
++             patch.object(p,'tc_ok',side_effect=lambda port,rec,*arg:healthy('tc',rec)),\
++             patch.object(p,'apply_nft',side_effect=lambda port,rec:mark_applied('nft',port,rec)) as nft_apply,\
++             patch.object(p,'apply_tc',side_effect=lambda port,rec,iface:mark_applied('tc',port,rec)) as tc_apply:
++            for t in (100,130,160):
++                self.now=t
++                with self.assertRaisesRegex(p.Error,'40002'):
++                    p.reconcile(self.config,monitor=True)
++        healthy_rec=p.read_json(p.port_file(40001))
++        self.assertEqual(healthy_rec['up'],625000)
++        self.assertFalse(healthy_rec['pending'])
++        self.assertEqual(healthy_rec['runtime']['dirs']['up']['phase'],'hold')
++        self.assertEqual(limits['tc']['up'],625000)
++        self.assertEqual(limits['nft']['up'],625000)
++        self.assertTrue(bad.exists())
++        tc_apply.assert_called_once()
++        nft_apply.assert_called_once()
++
++    def test_corrupt_sibling_blocks_new_tc_pref_allocation(self):
++        r=record();r.pop('tc_prefs');r['pending']=True
++        p.write_json(p.port_file(40001),r)
++        p.port_file(40002).write_text('"corrupted"')
++        with patch.object(p,'ensure_base',return_value=[]),\
++             patch.object(p,'tc_snapshot',return_value={}),\
++             patch.object(p,'nft_ok',return_value=True),\
++             patch.object(p,'tc_ok',return_value=False),\
++             patch.object(p,'tc_filters',return_value=[]),\
++             patch.object(p,'apply_tc') as tc_apply:
++            with self.assertRaisesRegex(p.Error,'拒绝分配新的 tc pref'):
++                p.reconcile(self.config,False)
++        persisted=p.read_json(p.port_file(40001))
++        self.assertTrue(persisted['pending'])
++        self.assertNotIn('tc_prefs',persisted)
++        tc_apply.assert_not_called()
++
++    def test_corrupt_sibling_rejects_new_slot_before_nft_mutation(self):
++        r=record();r.pop('tc_prefs');r['pending']=True
++        with patch.object(p,'nft_ok',return_value=False),\
++             patch.object(p,'apply_nft') as nft_apply,\
++             patch.object(p,'ensure_tc_prefs') as tc_alloc:
++            with self.assertRaisesRegex(p.Error,'拒绝分配新的 tc pref'):
++                p.apply(40001,r,self.config,watch_rows={40001:r},damaged_siblings=True)
++        nft_apply.assert_not_called()
++        tc_alloc.assert_not_called()
++
++    def test_corrupt_sibling_does_not_override_foreign_tc_pref(self):
++        r=record();r['pending']=True
++        p.write_json(p.port_file(40001),r)
++        p.port_file(40002).write_text('"corrupted"')
++        foreign={'pref':r['tc_prefs']['4_tcp'],'protocol':'ip','kind':'flower','chain':0,
++                 'options':{'handle':'0x1', 'keys':{'ip_proto':'udp','dst_port':40002}}}
++        def filters(iface,td):return [foreign] if td=='ingress' else []
++        with patch.object(p,'ensure_base',return_value=[]),\
++             patch.object(p,'tc_snapshot',return_value={}),\
++             patch.object(p,'nft_ok',return_value=True),\
++             patch.object(p,'tc_ok',return_value=False),\
++             patch.object(p,'tc_filters',side_effect=filters),\
++             patch.object(p,'apply_tc') as tc_apply:
++            with self.assertRaisesRegex(p.Error,'非本模块 tc 规则'):
++                p.reconcile(self.config,False)
++        self.assertTrue(p.read_json(p.port_file(40001))['pending'])
++        tc_apply.assert_not_called()
++
++    def test_interactive_pref_mutation_remains_strict_with_corrupt_sibling(self):
++        r=record();p.write_json(p.port_file(40001),r)
++        p.port_file(40002).write_text('"corrupted"')
++        with patch.object(p,'tc_filters',return_value=[]):
++            with self.assertRaises(p.Error):
++                p.ensure_tc_prefs(40001,r,'eth0')
++
++    def test_corrupt_sibling_does_not_block_hold_expiry_restoration(self):
++        r=record();r['up']=625000;r['runtime']['dirs']['up'].update(phase='hold',until=250)
++        p.write_json(p.port_file(40001),r)
++        p.port_file(40002).write_text('"corrupted"')
++        limit=dict(up=r['up'],down=r['down'])
++        with patch.object(p,'ensure_base',return_value=[]),\
++             patch.object(p,'tc_snapshot',return_value={}),\
++             patch.object(p,'traffic_snapshot',return_value={}),\
++             patch.object(p,'traffic_sample',return_value=sample(251,0)),\
++             patch.object(p,'tc_filters',return_value=[]),\
++             patch.object(p,'nft_ok',side_effect=lambda port,rec,*args:rec['up']==limit['up']),\
++             patch.object(p,'tc_ok',side_effect=lambda port,rec,*args:rec['up']==limit['up']),\
++             patch.object(p,'apply_nft',side_effect=lambda port,rec:limit.update(up=rec['up'])),\
++             patch.object(p,'apply_tc',side_effect=lambda port,rec,iface:limit.update(up=rec['up'])):
++            self.now=251
++            with self.assertRaisesRegex(p.Error,'40002'):
++                p.reconcile(self.config,True)
++        saved=p.read_json(p.port_file(40001))
++        self.assertEqual(saved['up'],1250000)
++        self.assertEqual(saved['runtime']['dirs']['up']['phase'],'monitor')
++        self.assertFalse(saved['pending'])
++
+ if __name__=='__main__':unittest.main(verbosity=2)
