@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# portbw Phase A LAB release; 1s oneshot/timer preserved. Remote bootstrap: linshi/main.
+# portbw Phase C LAB release; resident 1s watchdog; remote bootstrap linshi/main.
 # Always check the exact embedded SHA256 before installing Python payload.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
@@ -15,7 +15,7 @@ usage() {
   bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main/portbw-install.sh) [install|update] [--iface eth0]
 
 Debian/Ubuntu + systemd + root：自动补齐依赖、核对源码哈希、识别默认路由网卡，
-并安装 nft + tc 双层限速、开机恢复服务和每1秒 best-effort 的原版 oneshot/timer 巡检。
+并安装 nft + tc 双层限速、开机恢复与每秒常驻监控（原 timer 保留为兜底）。
 自动检测服务内置 systemd 启动频率限流修复，不需要手工添加 drop-in。
 已有配置和端口规则保留。--nft-only 必须手动指定，不会静默降级。
 HELP
@@ -93,7 +93,7 @@ done
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='0626e73a5987b6ac308a9752fc0846af11e6273486f4573ae906e45ade075b5e'
+EXPECTED_PORTBW_SHA256='ec076f237095b6db9c67a60995680c6a74035c37f054c28e83854a82170637bc'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'
@@ -173,6 +173,7 @@ install_files() (
     trap - EXIT ERR INT TERM HUP
     if ((SUCCESS == 0 && ARMED == 1)); then
       systemctl stop portbw-watch.timer >/dev/null 2>&1 || true
+      timeout 40 systemctl stop portbw-watch.service >/dev/null 2>&1 || true
       rollback_failed=0
       for idx in "${!PRESENT[@]}"; do
         target="${PRESENT[$idx]}"
@@ -196,11 +197,16 @@ install_files() (
           enabled-runtime|linked-runtime) systemctl enable --runtime "$unit" >/dev/null 2>&1 || rollback_failed=1 ;;
           *) systemctl disable "$unit" >/dev/null 2>&1 || true ;;
         esac
-        # Do not rerun the old one-shot worker while restoring files.
+        # Do not start the old worker until ALL old files and unit state are restored.
         if [[ "$unit" == portbw-watch.timer && "${OLD_ACTIVE[$idx]}" == active ]]; then
           systemctl start "$unit" >/dev/null 2>&1 || rollback_failed=1
         fi
       done
+      # If an old resident worker was active, restart that exact OLD version.
+      # Oneshot workers are almost always inactive at upgrade start.
+      if ((OLD_WORKER_ACTIVE)); then
+        timeout 40 systemctl start portbw-watch.service >/dev/null 2>&1 || rollback_failed=1
+      fi
       printf '[portbw] 安装失败；已尝试回滚程序、配置与 systemd 文件。端口意图状态保留，内核规则未清空；请核对 portbw audit。\n' >&2
       if ((rollback_failed)); then
         printf '[portbw] 部分回滚失败，保留备份：%s\n' "$BACKUP" >&2
@@ -229,9 +235,7 @@ install_files() (
   ARMED=1
 
   systemctl stop portbw-watch.timer >/dev/null 2>&1 || true
-  if ((OLD_WORKER_ACTIVE)); then
-    timeout 30 systemctl stop portbw-watch.service >/dev/null 2>&1 || die '旧 portbw 工作进程无法停止，拒绝更新'
-  fi
+  timeout 40 systemctl stop portbw-watch.service >/dev/null 2>&1 || die '旧 portbw 工作进程无法停止，拒绝更新'
 
   STAGED=("$PROGRAM.new.$$" "$WRAPPER.new.$$")
   install -m 0700 "$SRC/portbw.py" "${STAGED[0]}"
@@ -248,13 +252,34 @@ WRAPPER_EOF
   if ((NFT_ONLY)); then python_args+=(--nft-only); fi
   "$WRAPPER" "${python_args[@]}"
   "$WRAPPER" audit || die '安装后审计未通过，未认定安装成功'
+  # The Python installer has now RELEASED the manager lock: safe to block
+  # on Type=notify service readiness. Starting earlier can deadlock.
+  timeout 40 systemctl start portbw-watch.service || die '常驻监控无法完成首次健康采样；准备回滚'
   systemctl is-enabled --quiet portbw-watch.timer || die '自动检查 timer 未启用'
   systemctl is-active --quiet portbw-watch.timer || die '自动检查 timer 未启动'
   # Defense in depth: verify the effective setting after the nested installer.
   [[ "$(systemctl show portbw-watch.service -p StartLimitIntervalUSec)" == 'StartLimitIntervalUSec=0' ]] || \
     die 'portbw-watch.service 的有效 StartLimitIntervalSec 非 0；拒绝报告安装成功'
-  [[ "$(systemctl show portbw-watch.service -p Type --value)" == oneshot ]] || \
-    die 'portbw-watch.service 必须保持 Type=oneshot；拒绝报告安装成功'
+  [[ "$(systemctl show portbw-watch.service -p Type --value)" == notify ]] || \
+    die '常驻 portbw-watch.service 的 Type 必须为 notify'
+  [[ "$(systemctl show portbw-watch.service -p Restart --value)" == always ]] || \
+    die '常驻服务必须具备 Restart=always'
+  [[ "$(systemctl show portbw-watch.service -p WatchdogUSec --value)" == 30s ]] || \
+    die '常驻服务必须启用 30s watchdog'
+  systemctl is-active --quiet portbw-watch.service || die '常驻监控未运行'
+  # Require a fresh successful sample from the exact live MainPID, not only
+  # a counter increment or timer=active. Avoid claiming healthy on all-fail ticks.
+  mainpid="$(systemctl show portbw-watch.service -p MainPID --value)"
+  python3 -B - "$mainpid" <<'PY_WATCHD' || die '常驻监控没有新鲜的连续成功采样'
+import json,sys,time
+from pathlib import Path
+try:
+    data=json.loads(Path('/run/portbw/watchd.json').read_text())
+    assert data['pid']==int(sys.argv[1]) and data['successes']>=2
+    assert data['consecutive_failures']==0 and data['consecutive_successes']>=2 and data['error'] is None
+    assert 0<=time.clock_gettime(time.CLOCK_BOOTTIME)-data['last']<5
+except (OSError,ValueError,KeyError,AssertionError):sys.exit(1)
+PY_WATCHD
   SUCCESS=1
 )
 

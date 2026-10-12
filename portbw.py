@@ -1437,16 +1437,21 @@ UMask=0077
 WantedBy=multi-user.target
 ''',
     'portbw-watch.service':f'''[Unit]
-Description=Check and repair independent port bandwidth rules
+Description=Check and repair independent port bandwidth rules (resident 1s LAB)
 After=local-fs.target
-# At 1-second cadence, systemd's default 5 starts / 10 seconds causes
-# start-limit-hit (confirmed on Debian 12).  This applies ONLY to portbw.
 StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
-ExecStart={exe} watch
-TimeoutStartSec=120
+Type=notify
+NotifyAccess=main
+ExecStart={exe} watchd
+Restart=always
+RestartSec=1
+# A stuck kernel command may need up to 25s; watchdog is not a substitute for the
+# per-second healthy-tick counter. Never claim health for failed / skipped ticks.
+WatchdogSec=30
+TimeoutStartSec=30
+TimeoutStopSec=35
 UMask=0077
 ''',
     'portbw-watch.timer':'''[Unit]
@@ -1718,9 +1723,120 @@ def report_all(config):
     print('提示：本命令只读，不会修复规则、改变限速或重置滚动保护计时。')
 
 
+# -- Phase C LAB resident monitor -------------------------------------------------
+# The timer remains a best-effort backup, not proof that checks are succeeding.
+WATCH_PERIOD=1.0
+HEARTBEAT=VOLATILE.parent/'watchd.json'
+
+
+def _sd_notifier():
+    """Send readiness / watchdog notifications to systemd using only stdlib."""
+    path=os.environ.get('NOTIFY_SOCKET','')
+    if not path or path[0] not in '/@':
+        return lambda payload:None
+    import socket
+    sock=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM|socket.SOCK_CLOEXEC)
+    address=('\0'+path[1:]) if path[0]=='@' else path
+    def notify(payload):
+        # If sd_notify fails, the service must NOT claim readiness or health.
+        sock.sendto(payload.encode('utf8'),address)
+    return notify
+
+
+def watchd():
+    """Run the UNCHANGED Phase-A reconcile under a monotonic 1-second grid.
+
+    Do not cache kernel / config / traffic between ticks. A lock miss is not a
+    successful tick. Three consecutive missed/failed checks cause a nonzero
+    exit and systemd restart, not spurious WATCHDOG=1 or READY=1.
+    """
+    import signal
+    try:sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError,ValueError):pass
+    stopped=[False]
+    sigs={signal.SIGINT,signal.SIGTERM}
+    def stop(signum,frame):stopped[0]=True
+    for sig in sigs:signal.signal(sig,stop)
+    def sleep_interruptible(seconds):
+        # Block signals only while idle; child nft/tc commands cannot inherit
+        # our blocked signal mask. Use absolute CLOCK_BOOTTIME deadlines.
+        if seconds<=0 or stopped[0]:return
+        signal.pthread_sigmask(signal.SIG_BLOCK,sigs)
+        try:
+            if not stopped[0] and signal.sigtimedwait(sigs,seconds) is not None:
+                stopped[0]=True
+        finally:signal.pthread_sigmask(signal.SIG_UNBLOCK,sigs)
+
+    notify=_sd_notifier()
+    born=boottime();due=born;attempts=0;successes=0;misses=0
+    consecutive_failures=0;consecutive_successes=0;ready=False
+    last_success=None
+    last_error=None;logged_at=-1e9;miss_logged_at=-1e9
+    # No READY until two consecutive complete successful kernel checks.
+    while not stopped[0]:
+        started=boottime();error=None
+        try:
+            with lock(try_only=True) as acquired:
+                if not acquired:
+                    raise Error('本轮管理锁繁忙，未能检查内核规则')
+                reconcile(cfg(),monitor=True)
+        except Exception as exc:
+            error=str(exc) if isinstance(exc,Error) else f'{type(exc).__name__}: {exc}'
+        finished=boottime();attempts+=1
+        # A completed kernel audit is not proof of 1 Hz if the tick overran.
+        # Such a missed slot is an explicit health failure, never a healthy ping.
+        due+=WATCH_PERIOD
+        skipped=0
+        if due<=finished:
+            skipped=int((finished-due)//WATCH_PERIOD)+1
+            misses+=skipped;due+=skipped*WATCH_PERIOD
+            if finished-miss_logged_at>=30:
+                print(f'[portbw] watchd 本轮耗时 {finished-started:.3f}s，错过 {skipped} 个每秒采样槽(累计 {misses})',file=sys.stderr,flush=True)
+                miss_logged_at=finished
+            if error is None:
+                error=f'本轮超出每秒栅格，漏掉 {skipped} 次计划采样'
+        if error is None:
+            successes+=1;consecutive_failures=0
+            consecutive_successes+=1;last_success=finished
+        else:
+            consecutive_failures+=1;consecutive_successes=0
+        if error!=last_error or (error and finished-logged_at>=30):
+            if error:print(f'[portbw] watchd 检查失败({consecutive_failures}/3): {error}',file=sys.stderr,flush=True)
+            elif last_error:print('[portbw] watchd 内核检查已恢复',file=sys.stderr,flush=True)
+            logged_at=finished
+        last_error=error
+        try:
+            # Reporting failure/lock misses is *not* the same as health.
+            # Atomic tmpfs file is diagnostic only; sampling state keeps its
+            # original A-phase durable/volatile persistence semantics.
+            write_json(HEARTBEAT,{'pid':os.getpid(),'started':born,'attempts':attempts,
+                                  'successes':successes,'consecutive_successes':consecutive_successes,
+                                  'last':finished,'last_success':last_success,
+                                  'duration':round(finished-started,4),
+                                  'missed':misses,'consecutive_failures':consecutive_failures,
+                                  'error':error},sync=False,compact=True)
+        except Exception as exc:
+            error=f'无法写入监控健康记录: {exc}'
+            consecutive_failures+=1
+            consecutive_successes=0
+            print(f'[portbw] {error}',file=sys.stderr,flush=True)
+        # A successful completion is the ONLY way to advertise health.
+        if error is None:
+            if not ready and consecutive_successes>=2:
+                notify('READY=1\nSTATUS=portbw watchd 首次连续两轮检查通过')
+                ready=True
+            if ready:notify('WATCHDOG=1\nSTATUS=portbw watchd 内核检查成功')
+        if consecutive_failures>=3:
+            raise Error('watchd 连续3轮内核检查未成功，主动退出交由 systemd 重启')
+        if stopped[0]:break
+        sleep_interruptible(max(0.0,due-boottime()))
+    notify('STOPPING=1')
+
+
 def operate(args):
     action=args.action
     if action=='install':return install(args)
+    if action=='watchd':return watchd()
     with lock(try_only=action=='watch') as got:
         if not got:return
         config=cfg()
@@ -1787,7 +1903,7 @@ def main():
     y.add_argument('--cooldown',default='60s',help='恢复后冷却时间，默认 60s，可设 0s')
     for name in ('status','off'):
         y=auto_sub.add_parser(name);y.add_argument('port')
-    for name in ('list','report','audit','repair','watch','status'):subs.add_parser(name)
+    for name in ('list','report','audit','repair','watch','watchd','status'):subs.add_parser(name)
     try:
         if os.geteuid():raise Error('请使用 root')
         operate(p.parse_args())
