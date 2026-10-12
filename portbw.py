@@ -3,22 +3,24 @@
 
 No dependency on VLESS, SOCKS5, WireGuard, or any external node lifecycle.
 Never changes a device root qdisc, BBR, iptables, or other nft tables.
+
+Phase A test build: preserve original 1-second best-effort systemd oneshot/timer and
+all existing auto-limiting state-machine semantics. Reduce duplicate same-tick nft/TC
+work by reusing per-tick snapshots and indexes; never cache kernel data across ticks.
+For isolated helan testing only; NOT production validated.
 """
 from __future__ import annotations
-import argparse
+from bisect import bisect_right
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 import fcntl
 import json
 import math
-import copy
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 STATE=Path(os.getenv('PORTBW_STATE','/var/lib/portbw'))
@@ -51,21 +53,27 @@ def run(argv, *, input=None, check=True, timeout=25):
         raise Error(f'{" ".join(map(str,argv))}：{res.stderr.strip()[:600]}')
     return res.stdout
 
-def write_atomic(path, data, mode=0o600):
+def write_atomic(path, data, mode=0o600, sync=True):
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-    fd,temporary=tempfile.mkstemp(prefix='.'+path.name+'.',dir=path.parent)
+    temporary=path.parent/f'.{path.name}.{os.getpid()}.{time.monotonic_ns():x}'
+    fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC,0o600)
     try:
         with os.fdopen(fd,'wb') as f:
-            f.write(data);f.flush();os.fchmod(f.fileno(),mode);os.fsync(f.fileno())
+            f.write(data);f.flush();os.fchmod(f.fileno(),mode)
+            if sync:os.fsync(f.fileno())
         os.replace(temporary,path)
-        fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
-        try:os.fsync(fd)
-        finally:os.close(fd)
+        if sync:
+            fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+            try:os.fsync(fd)
+            finally:os.close(fd)
     finally:
         if os.path.lexists(temporary):os.unlink(temporary)
 
-def write_json(p,obj):
-    write_atomic(p,(json.dumps(obj,indent=2,ensure_ascii=False,sort_keys=True)+'\n').encode())
+def write_json(p,obj,*,sync=True,compact=False):
+    # sync=False/compact=True is used ONLY for tmpfs sampler state under /run.
+    if compact:text=json.dumps(obj,separators=(',',':'),ensure_ascii=False,sort_keys=True)+'\n'
+    else:text=json.dumps(obj,indent=2,ensure_ascii=False,sort_keys=True)+'\n'
+    write_atomic(p,text.encode(),sync=sync)
 
 def read_json(p,default=None):
     if not p.exists():
@@ -219,6 +227,9 @@ add chain inet {TABLE} outbound {{ type filter hook output priority -5; policy a
     else:
         chains=_check_owned_table(items,allow_missing=True)
         missing=set(CHAIN.values())-set(chains)
+        if not missing:
+            # Already fully validated; a second dump would only re-read the same state.
+            return items
         if missing:
             # Repair only genuinely missing owned chains. Never flush or replace others.
             script=''.join(f'add chain inet {TABLE} {name} {{ type filter hook '
@@ -307,17 +318,43 @@ def _rule_exact(rule,port,d,kind):
         return d=='up' and _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
     return _named_ref(expr[2],'counter')==countname(d,port)
 
-def nft_ok(port,rec,items=None):
+def nft_index(items):
+    """Validate the owned table ONCE and group rows per port (O(rows) per tick).
+
+    nft_ok() keeps the exact per-port rules; it just looks rows up here instead of
+    revalidating / rescanning the whole table for every port."""
+    validate_base(items)  # Includes isolation: no foreign rule in our chains.
+    rules={};limits={};named={};order={}
+    for i,x in enumerate(items):
+        rule=x.get('rule')
+        if rule:
+            m=OWNED_RULE_RE.fullmatch(str(rule.get('comment','')))
+            if m:rules.setdefault(int(m.group(1)),[]).append(rule)
+            order[rule['comment']]=i
+        if 'limit' in x:limits.setdefault(x['limit'].get('name'),[]).append(x['limit'])
+        for kind in ('limit','counter'):
+            obj=x.get(kind)
+            if obj:named.setdefault(obj.get('name'),[]).append(kind)
+    return {'rules':rules,'limits':limits,'named':named,'order':order}
+
+def nft_index_safe(items):
+    try:return nft_index(items)
+    except (Error,ValueError,TypeError,KeyError,StopIteration):return False
+
+def nft_ok(port,rec,items=None,idx=None):
     try:
-        if items is None:items=nft_snapshot()
-        validate_base(items)  # Includes isolation: no foreign rule in our chains.
-        rules,objects=owned(items,port)
+        if idx is False:return False  # table failed validation: every port is unhealthy
+        if idx is None:
+            if items is None:items=nft_snapshot()
+            idx=nft_index(items)
+        rows=idx['rules'].get(port,[])
         desired=expected_comments(port,rec)
-        rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
         if {x['comment'] for x in rows}!=desired or len(rows)!=len(desired):return False
         # Inbound: nft and tc can both police. Outbound: nft OUTPUT drops
         # return EPERM to local UDP sendmsg(), aborting apps such as iperf3.
         # Only shared tc egress enforces outbound; nft keeps an exact counter.
+        names={limitname(d,port) for d in CHAIN}|{countname(d,port) for d in CHAIN}
+        objects=[(kind,name) for name in names for kind in idx['named'].get(name,[])]
         expected_obj={(kind,fun(d,port)) for d in CHAIN if rec[d]>0
                       for kind,fun in ((('limit',limitname),('counter',countname)) if d=='up'
                                        else (('counter',countname),))}
@@ -325,7 +362,7 @@ def nft_ok(port,rec,items=None):
         for d in CHAIN:
             if not rec[d]:continue
             if d=='up':
-                lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                lims=idx['limits'].get(limitname(d,port),[])
                 if len(lims)!=1:return False
                 lim=lims[0]
                 if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
@@ -335,7 +372,7 @@ def nft_ok(port,rec,items=None):
                 selected=[r for r in rows if r['comment']==comment(d,port,kind)]
                 if len(selected)!=1 or not _rule_exact(selected[0],port,d,kind):return False
             # DROP must precede named counter, and no earlier accept/bypass exists.
-            order={r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
+            order=idx['order']
             if d=='up' and order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
         return True
     except (Error,ValueError,TypeError,KeyError,StopIteration):return False
@@ -532,11 +569,12 @@ def tc_target(port,direction,family,transport,rec):
             'handle':f'0x{tc_handle(port):x}',
             'field':'dst_port' if direction=='up' else 'src_port'}
 
-def tc_find(iface,port,direction,family,transport,rec,rows=None,strict=True):
+def tc_find(iface,port,direction,family,transport,rec,rows=None,strict=True,bypref=None):
     expected=tc_target(port,direction,family,transport,rec)
     if rows is None:rows=tc_filters(iface,'ingress' if direction=='up' else 'egress')
     candidates=[]
-    for entry in rows:
+    source=bypref.get(expected['pref'],()) if bypref is not None else rows
+    for entry in source:
         try:epref=int(entry.get('pref',-1))
         except (TypeError,ValueError):continue
         if epref!=expected['pref']:continue
@@ -566,12 +604,15 @@ def _tc_filter_body(text,port,direction,family,transport,pref):
     next_filter=re.search(r'^filter protocol ',text[m.end():],re.M)
     return text[m.end():m.end()+next_filter.start() if next_filter else len(text)]
 
-def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None,check_rate=True):
+def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None,check_rate=True,blocks=None):
     if not entry:return False
     try:
-        if text is None:text=run(['tc','-s','filter','show','dev',iface,'ingress' if direction=='up' else 'egress'])
+        if text is None and blocks is None:
+            text=run(['tc','-s','filter','show','dev',iface,'ingress' if direction=='up' else 'egress'])
         pref=tc_pref(port,family,transport,rec)
-        fragment=_tc_filter_body(text,port,direction,family,transport,pref)
+        if blocks is not None:
+            fragment=blocks.get((tc_protocol(family),str(pref),format(tc_handle(port),'x')))
+        else:fragment=_tc_filter_body(text,port,direction,family,transport,pref)
         if not fragment:return False
         field='dst_port' if direction=='up' else 'src_port'
         expected_type='ipv4' if family==4 else 'ipv6'
@@ -731,34 +772,88 @@ def tc_gc_unbound_police(port,index):
         time.sleep(0.25)
 
 
-def tc_snapshot(iface):
+_FILTER_START=re.compile(r'^filter protocol ',re.M)
+_FILTER_HEAD=re.compile(r'^filter protocol (\S+) pref ([0-9]+) flower chain 0 handle (?:0x)?([0-9a-f]+)\b',re.M)
+
+def tc_filter_blocks(text):
+    """Split `tc -s filter show` ONCE into {(protocol,pref,handle_hex): body}.
+
+    Same contract as _tc_filter_body(): first matching header wins; body runs to the
+    next line that starts with 'filter protocol ' (or the end of the text)."""
+    starts=[m.start() for m in _FILTER_START.finditer(text)]
+    blocks={}
+    for m in _FILTER_HEAD.finditer(text):
+        key=(m[1],m[2],m[3])
+        if key in blocks:continue
+        n=bisect_right(starts,m.start())
+        blocks[key]=text[m.end():starts[n] if n<len(starts) else len(text)]
+    return blocks
+
+def tc_index(rows,text):
+    groups={}
+    for tcdir,filters in rows.items():
+        g={}
+        for row in filters:
+            try:pref=int(row['pref'])
+            except (ValueError,TypeError,KeyError):continue
+            if 1<=pref<=65535:g.setdefault(pref,[]).append(row)
+        groups[tcdir]=g
+    return {'groups':groups,'blocks':{tcdir:tc_filter_blocks(t) for tcdir,t in text.items()}}
+
+def _pref_busy(groups,pref,port,direction,family,transport):
+    """Single-pref form of `pref in _used_tc_prefs(...)` (prefs are judged independently)."""
+    rows=groups.get(pref)
+    if not rows:return False
+    details=[r for r in rows if isinstance(r.get('options'),dict)]
+    return not details or not all(_tc_slot_owned(r,port,direction,family,transport) for r in details)
+
+def _action_exists(snap,index):
+    """One police-action dump per tick instead of one fork per zero-rate direction."""
+    if snap is None:return tc_action_exists(index)
+    if 'actions' not in snap:
+        try:snap['actions']=police_blocks(run(['tc','-s','actions','ls','action','police']))
+        except Error:snap['actions']=None
+    acts=snap['actions']
+    return tc_action_exists(index) if acts is None else index in acts
+
+def tc_snapshot(iface,actions=None):
     # One coherent read pass per audit/watch invocation, not per customer port.
-    return {
+    snap={
         'qdiscs':tc_qdiscs(iface),
         'rows':{d:tc_filters(iface,d) for d in ('ingress','egress')},
         'text':{d:run(['tc','-s','filter','show','dev',iface,d]) for d in ('ingress','egress')},
     }
+    snap['idx']=tc_index(snap['rows'],snap['text'])
+    if actions is not None:snap['actions']=actions['blocks']
+    return snap
 
 def tc_ok(port,rec,iface,snap=None):
     try:
         if 'clsact' not in {e.get('kind') for e in (snap['qdiscs'] if snap else tc_qdiscs(iface))}:return False
+        idx=snap.get('idx') if snap else None
         for direction in CHAIN:
             tcdir='ingress' if direction=='up' else 'egress'
             rows=snap['rows'][tcdir] if snap else tc_filters(iface,tcdir)
+            groups=idx['groups'][tcdir] if idx else None
             targets=[]
             for family in FAMILIES:
                 for transport in TRANSPORTS:
                     pref=tc_pref(port,family,transport,rec)
-                    if pref in _used_tc_prefs(rows,port,direction,family,transport):return False
-                    entry=tc_find(iface,port,direction,family,transport,rec,rows,strict=rec[direction]>0)
+                    if groups is not None:
+                        if _pref_busy(groups,pref,port,direction,family,transport):return False
+                    elif pref in _used_tc_prefs(rows,port,direction,family,transport):return False
+                    entry=tc_find(iface,port,direction,family,transport,rec,rows,strict=rec[direction]>0,bypref=groups)
                     targets.append((family,transport,entry))
             if rec[direction]==0:
-                if any(entry for _,_,entry in targets) or tc_action_exists(tc_police_index(port,direction)):
+                if any(entry for _,_,entry in targets) or _action_exists(snap,tc_police_index(port,direction)):
                     return False
                 continue
             if not all(entry for _,_,entry in targets):return False
-            text=snap['text'][tcdir] if snap else run(['tc','-s','filter','show','dev',iface,tcdir])
-            if not all(tc_rate_is_ok(entry,rec[direction],iface,direction,port,family,transport,rec,text)
+            if idx:
+                text=snap['text'][tcdir];blocks=idx['blocks'][tcdir]
+            else:
+                text=snap['text'][tcdir] if snap else run(['tc','-s','filter','show','dev',iface,tcdir]);blocks=None
+            if not all(tc_rate_is_ok(entry,rec[direction],iface,direction,port,family,transport,rec,text,blocks=blocks)
                        for family,transport,entry in targets):return False
         return True
     except Error:return False
@@ -958,6 +1053,7 @@ def volatile_checkpoint(rec):
 
 def volatile_save(port,rec):
     if 'auto' not in rec:return
+    # Preserve the original atomic fsync+rename persistence semantics, even under /run.
     write_json(volatile_path(port),{'boot_id':rec['runtime']['boot_id'],
                                    'checkpoint':volatile_checkpoint(rec),
                                    'runtime':rec['runtime']})
@@ -1192,7 +1288,8 @@ def reconcile(config,monitor=False):
             finish_apply(port,rec,config,watch_rows=rows,damaged_siblings=True)
         else:
             finish_apply(port,rec,config)
-    if any('auto' in r for r in rows.values()) and not config.get('tc_enabled'):
+    has_auto=any('auto' in r for r in rows.values())
+    if has_auto and not config.get('tc_enabled'):
         raise Error('自动模式必须启用 tc；拒绝 nft-only 静默降级')
     for port,rec in rows.items():
         if 'auto' in rec and rec['runtime']['boot_id']!=identity:
@@ -1202,7 +1299,8 @@ def reconcile(config,monitor=False):
             volatile_load(port,rec)
     try:
         nft_items=ensure_base()
-        tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') else None
+        # No port records => nothing consumes a tc snapshot; skip the five tc forks.
+        tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') and rows else None
     except Exception:
         for port,rec in rows.items():
             if 'auto' in rec:
@@ -1210,13 +1308,17 @@ def reconcile(config,monitor=False):
                 volatile_clear(port)
                 write_json(port_file(port),rec)
         raise
+    nft_idx=nft_index_safe(nft_items)
     traffic=None;traffic_error='本轮没有有效统计'
-    if monitor and any('auto' in r for r in rows.values()):
+    if monitor and has_auto:
         try:traffic=traffic_snapshot()
         except Error as e:traffic_error=str(e);failures.append(traffic_error)
+    # Share the already-read police-action snapshot with zero-rate TC audits.
+    if tc_items is not None and traffic is not None:
+        tc_items['actions']=traffic['blocks']
     for port,rec in rows.items():
         try:
-            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items)
+            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items,nft_idx)
                      and (not config.get('tc_enabled') or tc_ok(port,rec,config['iface'],tc_items)))
             if 'auto' in rec:
                 if not healthy:
@@ -1310,8 +1412,8 @@ def listen_ports():
         if m:found.add(int(m.group(1)))
     return found
 
-def audit_one(port,rec,config,nft_items=None,tc_items=None):
-    nft=nft_ok(port,rec,nft_items)
+def audit_one(port,rec,config,nft_items=None,tc_items=None,nft_idx=None):
+    nft=nft_ok(port,rec,nft_items,nft_idx)
     tc=tc_ok(port,rec,config['iface'],tc_items) if config.get('tc_enabled') else None
     return ('OK' if nft and (tc is None or tc) and not (rec['down']>0 and tc is None)
             and not rec.get('pending')
@@ -1362,6 +1464,7 @@ WantedBy=timers.target
     }
 
 def install(args):
+    import shutil
     for program in ('nft','tc','ip','ss','systemctl'):
         if not shutil.which(program):raise Error(f'缺少命令：{program}')
     if not Path('/run/systemd/system').exists():raise Error('需要 PID1=systemd')
@@ -1447,6 +1550,174 @@ def install(args):
             raise
         print(f'portbw 安装/更新完成；接口={iface}；双层 tc={enabled}；不会修改 root qdisc。')
 
+def _report_char_width(char):
+    # Match the independent vless_audit.sh table renderer: CJK is 2 cells.
+    from unicodedata import combining, east_asian_width
+    if char in ('\n','\r') or combining(char):return 0
+    return 2 if east_asian_width(char) in ('W','F') else 1
+
+
+def _report_width(value):
+    return sum(_report_char_width(char) for char in str(value))
+
+
+def _report_pad(value,width,align='left'):
+    value=str(value)
+    gap=' '*max(0,width-_report_width(value))
+    return gap+value if align=='right' else value+gap
+
+
+def _report_wrap(value,width):
+    value=str(value or '-')
+    parts=[]
+    for line in value.replace('\r','').split('\n'):
+        line=line.strip()
+        if not line:
+            parts.append('');continue
+        while _report_width(line)>width:
+            cut=0;used=0
+            for i,char in enumerate(line):
+                w=_report_char_width(char)
+                if used+w>width:break
+                cut=i+1;used+=w
+            if not cut:cut=1
+            # Break at a natural slash or separator when possible, like VLESS.
+            breaking=max((i+1 for i,char in enumerate(line[:cut]) if char in '/_:- '),default=0)
+            if breaking and breaking>=cut//2:cut=breaking
+            parts.append(line[:cut].rstrip())
+            line=line[cut:].lstrip()
+        parts.append(line)
+    return parts or ['-']
+
+
+def _report_table(schema,rows):
+    """Same heavy box borders, row separators and CJK alignment as vless_audit.sh.
+
+    Standalone on purpose: SOCKS5 hosts may not have VLESS's renderer installed.
+    schema: (heading,min_width,ideal_width,max_width,align,weight).
+    """
+    headings=[item[0] for item in schema]
+    minimum=[item[1] for item in schema]
+    ideal=[item[2] for item in schema]
+    maximum=[item[3] for item in schema]
+    aligned=[item[4] for item in schema]
+    weights=[item[5] for item in schema]
+    columns_env=os.environ.get('COLUMNS','').strip()
+    term=int(columns_env) if columns_env.isdecimal() and int(columns_env)>0 else __import__('shutil').get_terminal_size(fallback=(120,24)).columns
+    available=max(sum(minimum),term-len(schema)-1)
+    widths=ideal[:]
+    if sum(widths)>available:
+        order=sorted(range(len(schema)),key=lambda i:(weights[i],ideal[i]-minimum[i]),reverse=True)
+        remaining=sum(widths)-available
+        while remaining:
+            changed=False
+            for i in order:
+                if widths[i]>minimum[i]:
+                    widths[i]-=1;remaining-=1;changed=True
+                    if not remaining:break
+            if not changed:break
+    elif sum(widths)<available:
+        order=sorted(range(len(schema)),key=lambda i:(weights[i],maximum[i]-ideal[i]),reverse=True)
+        remaining=available-sum(widths)
+        while remaining:
+            changed=False
+            for i in order:
+                if widths[i]<maximum[i]:
+                    widths[i]+=1;remaining-=1;changed=True
+                    if not remaining:break
+            if not changed:break
+    def edge(left,mid,right):return left+mid.join('━'*w for w in widths)+right
+    print(edge('┏','┳','┓'))
+    print('┃'+'│'.join(_report_pad(h,w) for h,w in zip(headings,widths))+'┃')
+    print(edge('┣','╋','┫'))
+    for i,row in enumerate(rows):
+        wrapped=[_report_wrap(item,w) for item,w in zip(row,widths)]
+        for line_index in range(max(map(len,wrapped))):
+            cells=[_report_pad(parts[line_index] if line_index<len(parts) else '',widths[j],aligned[j])
+                   for j,parts in enumerate(wrapped)]
+            print('┃'+'│'.join(cells)+'┃')
+        if i+1<len(rows):print(edge('┣','╋','┫'))
+    print(edge('┗','┻','┛'))
+
+
+def _report_one_table(items):
+    """全中文单表格：每个端口一行；窄终端优先保留限速核心信息。"""
+    columns=[
+        ('端口','right'),('模式','left'),('当前上/下','right'),
+        ('正常上/下','right'),('降速上/下','right'),('运行阶段','left'),
+        ('阈值','right'),('持续','right'),('保护','right'),('冷却','right'),
+        ('监听','left'),('防火墙','left'),('流控','left'),('状态','left'),
+    ]
+    widths=[max(_report_width(head),*(_report_width(row[i]) for row in items))
+            for i,(head,_) in enumerate(columns)]
+    columns_env=os.environ.get('COLUMNS','').strip()
+    term=(int(columns_env) if columns_env.isdecimal() and int(columns_env)>0
+          else __import__('shutil').get_terminal_size(fallback=(120,24)).columns)
+    show=list(range(len(columns)))
+    # 诊断类信息在窄终端下最后显示；限速值和触发条件永不省略。
+    # 运行阶段也尽量保留；如终端极窄，仍保持一端口一行而不拆成多张表。
+    for i in (10,11,12,5):
+        if sum(widths[j] for j in show)+len(show)+1<=term:break
+        show.remove(i)
+    frame_width=sum(widths[j] for j in show)+len(show)+1
+    if frame_width>term:
+        print(f'注意：当前终端宽度为 {term} 列，完整限速参数需要 {frame_width} 列；'
+              '请加宽终端，表格不会截断数值。')
+    schema=[(columns[i][0],widths[i],widths[i],widths[i],columns[i][1],1)
+            for i in show]
+    _report_table(schema,[tuple(str(row[i]) for i in show) for row in items])
+    hidden=[columns[i][0] for i in range(len(columns)) if i not in show]
+    if hidden:
+        print('因终端较窄暂不显示：'+'、'.join(hidden)+'；加宽窗口可查看全部列。')
+
+
+def report_all(config):
+    """只读查询全部限速：静态、自动混排，使用现有内核审计快照。"""
+    rows=records()
+    if not rows:
+        print('当前没有已保存的端口限速规则。')
+        return
+    listening=listen_ports()
+    nft_items=nft_snapshot(False)
+    nft_idx=nft_index_safe(nft_items) if nft_items is not None else None
+    tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') else None
+    phases={'monitor':'监控','entering':'应用中','hold':'保护中',
+            'restoring':'恢复中','cooldown':'冷却'}
+    auto_count=0;unhealthy=[];items=[]
+    for port,rec in sorted(rows.items()):
+        state,nft,tc=audit_one(port,rec,config,nft_items,tc_items,nft_idx)
+        a=rec.get('auto')
+        now=f'{rate_mbps(rec["up"])}/{rate_mbps(rec["down"])}'
+        if a:
+            auto_count+=1
+            base=f'{rate_mbps(a["base"]["up"])}/{rate_mbps(a["base"]["down"])}'
+            limited=f'{rate_mbps(a["limited"]["up"])}/{rate_mbps(a["limited"]["down"])}'
+            phases_now=rec['runtime']['dirs']
+            phase=f'{phases[phases_now["up"]["phase"]]}/{phases[phases_now["down"]["phase"]]}'
+            trigger=f'{a["trigger_bp"]/100:g}%'
+            after=f'{a["after"]}s'
+            hold=f'{a["hold"]}s'
+            cool=f'{a["cooldown"]}s'
+        else:
+            base=now;limited=phase=trigger=after=hold=cool='-'
+        items.append((port,'自动' if a else '静态',now,base,limited,phase,
+                      trigger,after,hold,cool,
+                      '是' if port in listening else '否','正常' if nft else '异常',
+                      '停用' if tc is None else '正常' if tc else '异常',
+                      '正常' if state=='OK' else '异常'))
+        if state!='OK':unhealthy.append(port)
+    print(f'端口限速总览：共 {len(rows)} 个端口；速度单位 Mbps（上/下=上传/下载）')
+    _report_one_table(items)
+    print('说明：当前=正在生效的限速；正常=基础速度；降速=触发后的速度；'
+          '运行阶段=上传/下载分别对应的状态。')
+    print('阈值=触发百分比；持续=触发前连续秒数；保护=滚动保护秒数；'
+          '冷却=恢复后等待秒数；“-”表示静态模式不适用。')
+    print(f'合计 {len(rows)} 个端口：自动 {auto_count}，静态 {len(rows)-auto_count}；内核异常 {len(unhealthy)}。')
+    if unhealthy:
+        print('注意：端口 '+', '.join(map(str,unhealthy))+' 的规则状态异常，请运行 portbw audit 检查。')
+    print('提示：本命令只读，不会修复规则、改变限速或重置滚动保护计时。')
+
+
 def operate(args):
     action=args.action
     if action=='install':return install(args)
@@ -1469,6 +1740,7 @@ def operate(args):
             commit(port,up,down,config,deleting=action=='del')
             print(f'{port}: {"已手动取消" if action=="del" else f"上传 {rate_mbps(up)}Mbps / 下载 {rate_mbps(down)}Mbps"}')
             return
+        if action=='report':return report_all(config)
         if action=='auto':return auto_operate(args,config)
         if action in ('watch','repair'):
             reconcile(config,monitor=action=='watch')
@@ -1481,10 +1753,11 @@ def operate(args):
             else:rows=records()
             listening=listen_ports()  # audit also reports actual LISTEN state
             nft_items=nft_snapshot(False)
+            nft_idx=nft_index_safe(nft_items) if nft_items is not None else None
             tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') else None
             print(f'{"PORT":>5} {"UP Mbps":>10} {"DOWN Mbps":>10} {"LISTEN":>8} {"NFT":>6} {"TC":>7}  STATE')
             for port,rec in rows.items():
-                state,nft,tc=audit_one(port,rec,config,nft_items,tc_items)
+                state,nft,tc=audit_one(port,rec,config,nft_items,tc_items,nft_idx)
                 print(f'{port:>5} {rate_mbps(rec["up"]):>10} {rate_mbps(rec["down"]):>10} '
                       f'{("yes" if port in listening else "no"):>8} {("ok" if nft else "MISSING"):>6} '
                       f'{("off" if tc is None else "ok" if tc else "MISSING"):>7}  {state}')
@@ -1497,6 +1770,7 @@ def operate(args):
         raise Error('未知命令')
 
 def main():
+    import argparse
     os.umask(0o077)
     p=argparse.ArgumentParser(description='独立端口聚合限速（永久保存端口规则，与节点无关）')
     subs=p.add_subparsers(dest='action',required=True)
@@ -1513,7 +1787,7 @@ def main():
     y.add_argument('--cooldown',default='60s',help='恢复后冷却时间，默认 60s，可设 0s')
     for name in ('status','off'):
         y=auto_sub.add_parser(name);y.add_argument('port')
-    for name in ('list','audit','repair','watch','status'):subs.add_parser(name)
+    for name in ('list','report','audit','repair','watch','status'):subs.add_parser(name)
     try:
         if os.geteuid():raise Error('请使用 root')
         operate(p.parse_args())

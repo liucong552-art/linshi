@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# portbw v5.2.2 rolling hold VPS-first TEST candidate; support local pair or remote bootstrap from linshi/main.
+# portbw Phase A LAB release; 1s oneshot/timer preserved. Remote bootstrap: linshi/main.
 # Always check the exact embedded SHA256 before installing Python payload.
 # Never resets root qdisc, flushes foreign nft tables, or modifies node services.
 set -Eeuo pipefail
@@ -15,7 +15,7 @@ usage() {
   bash <(curl -fsSL https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main/portbw-install.sh) [install|update] [--iface eth0]
 
 Debian/Ubuntu + systemd + root：自动补齐依赖、核对源码哈希、识别默认路由网卡，
-并安装 nft + tc 双层限速、开机恢复服务和每1秒自检 timer（best effort）。
+并安装 nft + tc 双层限速、开机恢复服务和每1秒 best-effort 的原版 oneshot/timer 巡检。
 自动检测服务内置 systemd 启动频率限流修复，不需要手工添加 drop-in。
 已有配置和端口规则保留。--nft-only 必须手动指定，不会静默降级。
 HELP
@@ -56,9 +56,9 @@ case "${SOURCE_SCRIPT##*/}" in
     WORK="$(mktemp -d /var/tmp/portbw-src.XXXXXXXX)"
     SRC="$WORK"
     BASE='https://raw.githubusercontent.com/liucong552-art/linshi/refs/heads/main'
-    log "远程下载测试版主体：$BASE/portbw.py"
+    log "远程下载 linshi 测试版主体：$BASE/portbw.py"
     curl --fail --silent --show-error --location --retry 3 --connect-timeout 10 --max-time 90 \
-      "$BASE/portbw.py" -o "$SRC/portbw.py" || die '测试仓库源码下载失败；请核对上传情况'
+      "$BASE/portbw.py" -o "$SRC/portbw.py" || die 'linshi 测试仓库源码下载失败；请核对发布情况'
     ;;
 esac
 
@@ -93,7 +93,7 @@ done
 
 # Embedded manifest: only TWO executable files need to exist online.
 # The sha256 of portbw.py must change together with this value in the installer.
-EXPECTED_PORTBW_SHA256='225013ce3933c6a56c26110b22ae70749154445695532348e6715f858f58d327'
+EXPECTED_PORTBW_SHA256='0626e73a5987b6ac308a9752fc0846af11e6273486f4573ae906e45ade075b5e'
 ACTUAL_PORTBW_SHA256="$(sha256sum "$SRC/portbw.py" | awk '{print $1}')"
 [[ "$ACTUAL_PORTBW_SHA256" == "$EXPECTED_PORTBW_SHA256" ]] || die "portbw.py SHA256 不符：实际 $ACTUAL_PORTBW_SHA256；为避免旧版混装已停止"
 python3 -B - "$SRC/portbw.py" <<'PY' || die 'portbw.py 语法校验失败'
@@ -253,6 +253,8 @@ WRAPPER_EOF
   # Defense in depth: verify the effective setting after the nested installer.
   [[ "$(systemctl show portbw-watch.service -p StartLimitIntervalUSec)" == 'StartLimitIntervalUSec=0' ]] || \
     die 'portbw-watch.service 的有效 StartLimitIntervalSec 非 0；拒绝报告安装成功'
+  [[ "$(systemctl show portbw-watch.service -p Type --value)" == oneshot ]] || \
+    die 'portbw-watch.service 必须保持 Type=oneshot；拒绝报告安装成功'
   SUCCESS=1
 )
 
