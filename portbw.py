@@ -4,12 +4,12 @@
 No dependency on VLESS, SOCKS5, WireGuard, or any external node lifecycle.
 Never changes a device root qdisc, BBR, iptables, or other nft tables.
 
-Resident monitor with indexed nft/tc audits. Kernel snapshots are accepted only
-after checking the mutation generation again INSIDE the management lock.
-Default strict automatic policies retain the repository v5.2.2 state machine;
-resilient sampling remains an explicit per-port option. Scheduling overruns are
-reported separately from invalid traffic samples. VPS throughput validation is
-still required for a particular kernel, interface and traffic workload.
+Phase C.2 TEST CANDIDATE: read kernel snapshots outside the management lock.
+A monotonic mutation generation excludes overlapping rule transactions from
+state-machine decisions; invalid windows are counted but never treated as valid
+traffic samples or healthy audits.  Genuine failures still restart watchd.
+Original 30s trigger / 120s rolling hold and nft/tc fail-closed semantics remain.
+Not production validated: kernel and traffic fault testing required.
 """
 from __future__ import annotations
 from bisect import bisect_right
@@ -179,31 +179,23 @@ def set_mutation_epoch(n):
 
 
 @contextmanager
-def modifying(recover=False):
+def modifying():
     """Called INSIDE the exclusive manager lock around every CLI writer.
 
     On an ordinary exception a completed even generation invalidates readers.
     If a writer is killed, the odd generation survives in /run until a real
-    under-lock repair succeeds. Explicit repair/install may retry an abandoned
-    transaction with recover=True; a failed retry keeps its generation odd.
-    Never announce a healthy snapshot across it.
+    under-lock repair succeeds. Never announce a healthy snapshot across it.
     """
     old=mutation_epoch()
-    recovering=bool(old%2)
-    if recovering and not recover:
+    if old%2:
         # There can be no live writer: the caller already owns the flock.
         # Do not blindly erase a previous writer's incomplete transaction.
         raise Error('检测到上次未完成的管理事务；等待 watchd 自愈审计')
-    active=old+2 if recovering else old+1
-    set_mutation_epoch(active)
+    set_mutation_epoch(old+1)
     try:
         yield
-    except BaseException:
-        # An unsuccessful explicit repair must not clear an abandoned marker.
-        if not recovering:set_mutation_epoch(active+1)
-        raise
-    else:
-        set_mutation_epoch(active+1)
+    finally:
+        set_mutation_epoch(old+2)
 
 
 def readonly_kernel_probe():
@@ -1126,11 +1118,10 @@ def volatile_checkpoint(rec):
 
 def volatile_save(port,rec):
     if 'auto' not in rec:return
-    # This is disposable sampler state, never the durable phase/deadline/target.
-    # Atomic rename still prevents partial reads; loss rebases the sampler.
+    # Preserve the original atomic fsync+rename persistence semantics, even under /run.
     write_json(volatile_path(port),{'boot_id':rec['runtime']['boot_id'],
                                    'checkpoint':volatile_checkpoint(rec),
-                                   'runtime':rec['runtime']},sync=False,compact=True)
+                                   'runtime':rec['runtime']})
 
 
 def volatile_load(port,rec):
@@ -1198,7 +1189,7 @@ def traffic_snapshot():
     return {'start':start,'end':end,'blocks':police_blocks(output)}
 
 
-def traffic_sample(port,d,rec,snapshot,nft_items,nft_idx=None):
+def traffic_sample(port,d,rec,snapshot,nft_items):
     if snapshot is None:raise Error('tc 统计快照不可用')
     block=snapshot['blocks'].get(tc_police_index(port,d),'')
     sent=re.findall(r'\bSent\s+([0-9]+)\s+bytes\s+([0-9]+)\s+pkt\s+' 
@@ -1215,11 +1206,8 @@ def traffic_sample(port,d,rec,snapshot,nft_items,nft_idx=None):
     # Quantized installed age defines an interval, not a fabricated exact birth.
     # Intersect it over successive samples to detect action recreation even if
     # the new counter has already overtaken the previous counter.
-    if nft_idx is False:raise Error('nft 快照未通过校验，拒绝统计')
-    rules=(nft_idx['rules'].get(port,()) if nft_idx is not None
-           else (r['rule'] for r in nft_items if 'rule' in r))
-    handles=sorted(r['handle'] for r in rules
-                   if r.get('comment','').startswith(f'pbw-{port}-{d}-'))
+    handles=sorted(r['rule']['handle'] for r in nft_items if 'rule' in r
+                   and r['rule'].get('comment','').startswith(f'pbw-{port}-{d}-'))
     return {'bytes':count,'drops':drops,'overlimits':overlimits,
             'start':start,'end':end,
             'birth_lo':max(0.0,start-age-1.1),'birth_hi':end-age+0.1,
@@ -1472,7 +1460,7 @@ def reconcile(config,monitor=False,rebase_after_contention=False,prefetched=None
                     for d in CHAIN:
                         try:
                             if traffic is None:raise Error(traffic_error)
-                            samples[d]=traffic_sample(port,d,rec,traffic,nft_items,nft_idx)
+                            samples[d]=traffic_sample(port,d,rec,traffic,nft_items)
                         except Error as e:
                             samples[d]=None;errors[d]=str(e)
                             if traffic is not None:failures.append(f'{port}/{d}: {e}')
@@ -1577,8 +1565,8 @@ UMask=0077
 WantedBy=multi-user.target
 ''',
     'portbw-watch.service':f'''[Unit]
-Description=Check and repair independent port bandwidth rules (resident monitor)
-After=local-fs.target portbw-restore.service
+Description=Check and repair independent port bandwidth rules (resident 1s LAB)
+After=local-fs.target
 StartLimitIntervalSec=0
 
 [Service]
@@ -1613,7 +1601,7 @@ def install(args):
     for program in ('nft','tc','ip','ss','systemctl'):
         if not shutil.which(program):raise Error(f'缺少命令：{program}')
     if not Path('/run/systemd/system').exists():raise Error('需要 PID1=systemd')
-    with lock(), modifying(recover=True):
+    with lock(), modifying():
         before=cfg() if (CONF/'config.json').exists() else {}
         iface=args.iface or before.get('iface')
         if not iface or not IF_RE.fullmatch(iface) or iface in ('.','..'):
@@ -1689,9 +1677,7 @@ def install(args):
                     else:
                         run(['systemctl','disable',name],check=False)
                 for name,old in old_active.items():
-                    # A notify/oneshot worker needs manager.lock; don't wait
-                    # for its readiness while rollback still owns that lock.
-                    if (old or '').strip()=='active':run(['systemctl','start','--no-block',name],check=False)
+                    if (old or '').strip()=='active':run(['systemctl','start',name],check=False)
                     else:run(['systemctl','stop',name],check=False)
             except Exception as e:print(f'回滚配置时出错：{e}',file=sys.stderr)
             raise
@@ -1919,7 +1905,7 @@ def watchd():
         started=boottime();error=None;invalid_window=False;lock_busy=False
         # Snapshot collection is independent from the writer's flock.
         # Never accept data when the writer generation is odd or has changed.
-        before=None;after=None;current=None;raw=None;probe_error=None
+        before=None;after=None;raw=None;probe_error=None
         probes+=1
         try:
             before=mutation_epoch()
@@ -1933,36 +1919,30 @@ def watchd():
                 if not acquired:
                     lock_busy=True;invalid_window=True
                     error='管理锁繁忙：本轮已尝试读取真实内核，但无法提交有效审计'
-                else:
-                    # A writer may run AFTER `after` was read and BEFORE flock
-                    # is acquired. Only this third, locked read closes that gap.
-                    current=mutation_epoch()
-                if not acquired:
-                    pass
-                elif current%2:
+                elif before%2 or after%2:
                     # Writer exited mid-transaction while leaving an odd epoch.
                     # An acquired flock proves it is not still running. Repair
                     # first; only publish a clean generation after success.
-                    reconcile(cfg(),monitor=False)
-                    set_mutation_epoch(current+1)
-                    recovered_abandoned+=1
+                    if after%2:
+                        reconcile(cfg(),monitor=False)
+                        set_mutation_epoch(after+1)
+                        recovered_abandoned+=1
                     invalid_window=True
                     error='检测到未完成管理事务或规则代次切换，本轮流量样本作废'
-                elif before%2 or after%2 or not before==after==current:
+                elif before!=after:
                     invalid_window=True
                     error='采样期间规则事务版本变化，本轮流量样本作废'
                 elif probe_error is not None:
                     raise Error('真实内核快照失败：'+probe_error)
+                elif boottime()-started>=WATCH_PERIOD:
+                    # Avoid letting a long probe silently add artificial time
+                    # to the 30-second consecutive-saturation threshold.
+                    invalid_window=True
+                    error='真实内核快照超过1秒栅格，本轮流量样本作废'
                 else:
-                    # The original state machine validates the actual counter
-                    # interval and query duration. A late scheduler slot alone
-                    # does not invalidate otherwise sound traffic evidence.
-                    # Mark daemon writes too, so SIGKILL leaves a repairable
-                    # odd generation just like an interrupted CLI transaction.
-                    with modifying():
-                        reconcile(cfg(),monitor=True,
-                                  rebase_after_contention=rebase_required,
-                                  prefetched=raw)
+                    reconcile(cfg(),monitor=True,
+                              rebase_after_contention=rebase_required,
+                              prefetched=raw)
                     rebase_required=False
         except Exception as exc:
             error=str(exc) if isinstance(exc,Error) else f'{type(exc).__name__}: {exc}'
@@ -1982,8 +1962,8 @@ def watchd():
             if finished-miss_logged_at>=30:
                 print(f'[portbw] watchd 本轮耗时 {finished-started:.3f}s，错过 {skipped} 个采样槽(累计 {misses})',file=sys.stderr,flush=True)
                 miss_logged_at=finished
-            # Missed schedule slots are telemetry. observe() independently
-            # rejects an excessive real sample gap, matching v5.2.2 semantics.
+            if error is None:error=f'本轮超出每秒栅格，漏掉 {skipped} 个采样槽'
+            rebase_required=True
         if error is None:
             successes+=1;consecutive_failures=0
             consecutive_successes+=1;last_success=finished
@@ -2015,7 +1995,6 @@ def watchd():
                                   'abandoned_recovered':recovered_abandoned,
                                   'rebase_required':rebase_required,
                                   'generation_before':before,'generation_after':after,
-                                  'generation_locked':current,
                                   'error':error},sync=False,compact=True)
         except Exception as exc:
             error=f'无法写入监控健康记录：{exc}'
@@ -2041,7 +2020,7 @@ def operate(args):
     with lock(try_only=action=='watch') as got:
         if not got:return
         if action in ('set','up','down','del','repair','watch') or (action=='auto' and args.auto_action!='status'):
-            with modifying(recover=action=='repair'):
+            with modifying():
                 return _operate_locked(args)
         return _operate_locked(args)
 
@@ -2099,7 +2078,7 @@ def main():
     os.umask(0o077)
     p=argparse.ArgumentParser(description='独立端口聚合限速（永久保存端口规则，与节点无关）')
     subs=p.add_subparsers(dest='action',required=True)
-    x=subs.add_parser('install');x.add_argument('--iface');x.add_argument('--nft-only',action='store_true',help='仅支持上传静态限速；下载和自动模式需要 tc')
+    x=subs.add_parser('install');x.add_argument('--iface');x.add_argument('--nft-only',action='store_true',help='仅使用 nft，禁用 tc 次级保护')
     x=subs.add_parser('set');x.add_argument('port');x.add_argument('up_mbit');x.add_argument('down_mbit')
     x=subs.add_parser('up');x.add_argument('port');x.add_argument('up_mbit')
     x=subs.add_parser('down');x.add_argument('port');x.add_argument('down_mbit')
@@ -2110,7 +2089,7 @@ def main():
     for flag in ('up','down','trigger','after','auto-up','auto-down','hold'):
         y.add_argument('--'+flag,required=True)
     y.add_argument('--cooldown',default='60s',help='恢复后冷却时间，默认 60s，可设 0s')
-    y.add_argument('--resilient',action='store_true',help='单端口可选抗抖动满载窗口，默认保留仓库原版严格模式')
+    y.add_argument('--resilient',action='store_true',help='C.2.1 单端口可选抗抖动满载窗口，默认保留严格模式')
     for name in ('status','off'):
         y=auto_sub.add_parser(name);y.add_argument('port')
     for name in ('list','report','audit','repair','watch','watchd','status'):subs.add_parser(name)
